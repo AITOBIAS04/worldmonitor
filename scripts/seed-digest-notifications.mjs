@@ -29,6 +29,16 @@ const { decrypt } = require('./lib/crypto.cjs');
 const { callLLM } = require('./lib/llm-chain.cjs');
 const { fetchUserPreferences, extractUserContext, formatUserProfile } = require('./lib/user-context.cjs');
 const { Resend } = require('resend');
+import { readRawJsonFromUpstash, redisPipeline } from '../api/_upstash-json.js';
+import {
+  composeBriefFromDigestStories,
+  extractInsights,
+  groupEligibleRulesByUser,
+  shouldExitNonZero as shouldExitOnBriefFailures,
+} from './lib/brief-compose.mjs';
+import { enrichBriefEnvelopeWithLLM } from './lib/brief-llm.mjs';
+import { assertBriefEnvelope } from '../server/_shared/brief-render.js';
+import { signBriefUrl, BriefUrlError } from './lib/brief-url-sign.mjs';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +76,50 @@ const DIGEST_MEDIUM_LIMIT = 10;
 const AI_SUMMARY_CACHE_TTL = 3600; // 1h
 const AI_DIGEST_ENABLED = process.env.AI_DIGEST_ENABLED !== '0';
 const ENTITLEMENT_CACHE_TTL = 900; // 15 min
+
+// ── Brief composer (consolidation of the retired seed-brief-composer) ──────
+
+const BRIEF_URL_SIGNING_SECRET = process.env.BRIEF_URL_SIGNING_SECRET ?? '';
+const WORLDMONITOR_PUBLIC_BASE_URL =
+  process.env.WORLDMONITOR_PUBLIC_BASE_URL ?? 'https://worldmonitor.app';
+const BRIEF_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+// The brief is a once-per-day editorial snapshot. 24h is the natural
+// window regardless of a user's email cadence (daily / twice_daily /
+// weekly) — weekly subscribers still expect a fresh brief each day
+// in the dashboard panel. Matches DIGEST_LOOKBACK_MS so first-send
+// users see identical story pools in brief and email.
+const BRIEF_STORY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const INSIGHTS_KEY = 'news:insights:v1';
+
+// Operator kill switch — used to intentionally silence brief compose
+// without surfacing a Railway red flag. Distinguished from "secret
+// missing in a production rollout" which IS worth flagging.
+const BRIEF_COMPOSE_DISABLED_BY_OPERATOR = process.env.BRIEF_COMPOSE_ENABLED === '0';
+const BRIEF_COMPOSE_ENABLED =
+  !BRIEF_COMPOSE_DISABLED_BY_OPERATOR && BRIEF_URL_SIGNING_SECRET !== '';
+const BRIEF_SIGNING_SECRET_MISSING =
+  !BRIEF_COMPOSE_DISABLED_BY_OPERATOR && BRIEF_URL_SIGNING_SECRET === '';
+
+// Phase 3b LLM enrichment. Kept separate from AI_DIGEST_ENABLED so
+// the email-digest AI summary and the brief editorial prose can be
+// toggled independently (e.g. kill the brief LLM without silencing
+// the email's AI summary during a provider outage).
+const BRIEF_LLM_ENABLED = process.env.BRIEF_LLM_ENABLED !== '0';
+
+// Dependencies injected into brief-llm.mjs. Defined near the top so
+// the upstashRest helper below is in scope when this closure runs
+// inside composeAndStoreBriefForUser().
+const briefLlmDeps = {
+  callLLM,
+  async cacheGet(key) {
+    const raw = await upstashRest('GET', key);
+    if (typeof raw !== 'string' || raw.length === 0) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  },
+  async cacheSet(key, value, ttlSec) {
+    await upstashRest('SETEX', key, String(ttlSec), JSON.stringify(value));
+  },
+};
 
 // ── Redis helpers ──────────────────────────────────────────────────────────────
 
@@ -407,6 +461,7 @@ function formatDigestHtml(stories, nowMs) {
         </tr>
       </table>
       <div data-ai-summary-slot></div>
+      <div data-brief-cta-slot></div>
       <table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom: 24px;">
         <tr>
           <td style="text-align: center; padding: 14px 8px; width: 33%; background: #161616; border: 1px solid #222;">
@@ -583,6 +638,72 @@ function truncateTelegramHtml(html, limit = TELEGRAM_MAX_LEN) {
   const lastNewline = truncated.lastIndexOf('\n');
   const cutPoint = lastNewline > limit * 0.6 ? lastNewline : truncated.length;
   return sanitizeTelegramHtml(truncated.slice(0, cutPoint) + '\n\n[truncated]');
+}
+
+/**
+ * Phase 8: derive the 3 carousel image URLs from a signed magazine
+ * URL. The HMAC token binds (userId, issueDate), not the path — so
+ * the same token verifies against /api/brief/{u}/{d}?t=T AND against
+ * /api/brief/carousel/{u}/{d}/{0|1|2}?t=T.
+ *
+ * Returns null when the magazine URL doesn't match the expected shape
+ * — caller falls back to text-only delivery.
+ */
+function carouselUrlsFrom(magazineUrl) {
+  try {
+    const u = new URL(magazineUrl);
+    const m = u.pathname.match(/^\/api\/brief\/([^/]+)\/(\d{4}-\d{2}-\d{2})\/?$/);
+    if (!m) return null;
+    const [, userId, issueDate] = m;
+    const token = u.searchParams.get('t');
+    if (!token) return null;
+    return [0, 1, 2].map(
+      (p) => `${u.origin}/api/brief/carousel/${userId}/${issueDate}/${p}?t=${token}`,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send the 3-image brief carousel to a Telegram chat via sendMediaGroup.
+ * Telegram fetches each URL server-side, so our carousel edge function
+ * has to be publicly reachable (it is — HMAC is the only credential).
+ *
+ * Caption goes on the FIRST image only (Telegram renders one shared
+ * caption beneath the album). The caller still calls sendTelegram()
+ * afterward for the long-form text — carousel is the header, text is
+ * the body.
+ */
+async function sendTelegramBriefCarousel(userId, chatId, caption, magazineUrl) {
+  if (!TELEGRAM_BOT_TOKEN) return false;
+  const urls = carouselUrlsFrom(magazineUrl);
+  if (!urls) return false;
+  const media = urls.map((url, i) => ({
+    type: 'photo',
+    media: url,
+    ...(i === 0 ? { caption, parse_mode: 'HTML' } : {}),
+  }));
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'worldmonitor-digest/1.0' },
+        body: JSON.stringify({ chat_id: chatId, media }),
+        signal: AbortSignal.timeout(20000),
+      },
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn(`[digest] Telegram carousel ${res.status} for ${userId}: ${body.slice(0, 300)}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[digest] Telegram carousel error for ${userId}: ${err.code || err.message}`);
+    return false;
+  }
 }
 
 async function sendTelegram(userId, chatId, text) {
@@ -793,20 +914,46 @@ const DIVIDER = '─'.repeat(40);
  * Keeps the per-channel formatting logic out of main() so its cognitive
  * complexity stays within the lint budget.
  */
-function buildChannelBodies(storyListPlain, aiSummary) {
+function buildChannelBodies(storyListPlain, aiSummary, magazineUrl) {
+  // The URL is already HMAC-signed and shape-validated at sign time
+  // (userId regex + YYYY-MM-DD), but we still escape it per-target
+  // as defence-in-depth — same discipline injectBriefCta uses for
+  // the email button. Each target has different metacharacter rules.
+  const telegramSafeUrl = magazineUrl
+    ? String(magazineUrl)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+    : '';
+  const slackSafeUrl = magazineUrl
+    ? String(magazineUrl).replace(/[<>|]/g, '')
+    : '';
+  const briefFooterPlain = magazineUrl
+    ? `\n\n${DIVIDER}\n\n📖 Open your WorldMonitor Brief magazine:\n${magazineUrl}`
+    : '';
+  const briefFooterTelegram = magazineUrl
+    ? `\n\n${DIVIDER}\n\n📖 <a href="${telegramSafeUrl}">Open your WorldMonitor Brief magazine</a>`
+    : '';
+  const briefFooterSlack = magazineUrl
+    ? `\n\n${DIVIDER}\n\n📖 <${slackSafeUrl}|Open your WorldMonitor Brief magazine>`
+    : '';
+  const briefFooterDiscord = magazineUrl
+    ? `\n\n${DIVIDER}\n\n📖 [Open your WorldMonitor Brief magazine](${magazineUrl})`
+    : '';
   if (!aiSummary) {
     return {
-      text: storyListPlain,
-      telegramText: escapeTelegramHtml(storyListPlain),
-      slackText: escapeSlackMrkdwn(storyListPlain),
-      discordText: storyListPlain,
+      text: `${storyListPlain}${briefFooterPlain}`,
+      telegramText: `${escapeTelegramHtml(storyListPlain)}${briefFooterTelegram}`,
+      slackText: `${escapeSlackMrkdwn(storyListPlain)}${briefFooterSlack}`,
+      discordText: `${storyListPlain}${briefFooterDiscord}`,
     };
   }
   return {
-    text: `EXECUTIVE SUMMARY\n\n${aiSummary}\n\n${DIVIDER}\n\n${storyListPlain}`,
-    telegramText: `<b>EXECUTIVE SUMMARY</b>\n\n${markdownToTelegramHtml(aiSummary)}\n\n${DIVIDER}\n\n${escapeTelegramHtml(storyListPlain)}`,
-    slackText: `*EXECUTIVE SUMMARY*\n\n${markdownToSlackMrkdwn(aiSummary)}\n\n${DIVIDER}\n\n${escapeSlackMrkdwn(storyListPlain)}`,
-    discordText: `**EXECUTIVE SUMMARY**\n\n${markdownToDiscord(aiSummary)}\n\n${DIVIDER}\n\n${storyListPlain}`,
+    text: `EXECUTIVE SUMMARY\n\n${aiSummary}\n\n${DIVIDER}\n\n${storyListPlain}${briefFooterPlain}`,
+    telegramText: `<b>EXECUTIVE SUMMARY</b>\n\n${markdownToTelegramHtml(aiSummary)}\n\n${DIVIDER}\n\n${escapeTelegramHtml(storyListPlain)}${briefFooterTelegram}`,
+    slackText: `*EXECUTIVE SUMMARY*\n\n${markdownToSlackMrkdwn(aiSummary)}\n\n${DIVIDER}\n\n${escapeSlackMrkdwn(storyListPlain)}${briefFooterSlack}`,
+    discordText: `**EXECUTIVE SUMMARY**\n\n${markdownToDiscord(aiSummary)}\n\n${DIVIDER}\n\n${storyListPlain}${briefFooterDiscord}`,
   };
 }
 
@@ -823,6 +970,198 @@ function injectEmailSummary(html, aiSummary) {
 <div style="font-size:13px;line-height:1.7;color:#ccc;">${formattedSummary}</div>
 </div>`;
   return html.replace('<div data-ai-summary-slot></div>', summaryHtml);
+}
+
+/**
+ * Inject the "Open your brief" CTA into the email HTML. Placed near
+ * the top of the body so recipients see the magazine link before the
+ * story list. Uses inline styles only (Gmail / Outlook friendly).
+ * When no magazineUrl is present (composer skipped / signing
+ * failed), the slot is stripped so the email stays clean.
+ */
+function injectBriefCta(html, magazineUrl) {
+  if (!html) return html;
+  if (!magazineUrl) return html.replace('<div data-brief-cta-slot></div>', '');
+  const escapedUrl = String(magazineUrl)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  const ctaHtml = `<div style="margin:0 0 24px 0;">
+<a href="${escapedUrl}" style="display:inline-block;background:#f2ede4;color:#0a0a0a;text-decoration:none;font-weight:700;font-size:14px;letter-spacing:0.08em;padding:14px 22px;border-radius:4px;">Open your WorldMonitor Brief →</a>
+<div style="margin-top:10px;font-size:11px;color:#888;line-height:1.5;">Your personalised editorial magazine. Opens in the browser — scroll or swipe through today's threads.</div>
+</div>`;
+  return html.replace('<div data-brief-cta-slot></div>', ctaHtml);
+}
+
+// ── Brief composition (runs once per cron tick, before digest loop) ─────────
+
+/**
+ * Write brief:{userId}:{issueDate} for every eligible user and
+ * return { briefByUser, counters } for the digest loop + main's
+ * end-of-run exit gate. One brief per user regardless of how many
+ * variants they have enabled.
+ *
+ * Returns empty counters when brief composition is disabled,
+ * insights are unavailable, or the signing secret is missing. Never
+ * throws — the digest send path must remain independent of the
+ * brief path, so main() handles exit-codes at the very end AFTER
+ * the digest has been dispatched.
+ *
+ * @param {unknown[]} rules
+ * @param {number} nowMs
+ * @returns {Promise<{ briefByUser: Map<string, object>; composeSuccess: number; composeFailed: number }>}
+ */
+async function composeBriefsForRun(rules, nowMs) {
+  const briefByUser = new Map();
+  // Missing secret without explicit operator-disable = misconfigured
+  // rollout. Count it as a compose failure so the end-of-run exit
+  // gate trips and Railway flags the run red. Digest send still
+  // proceeds (compose failures must never block notification
+  // delivery to users).
+  if (BRIEF_SIGNING_SECRET_MISSING) {
+    console.error(
+      '[digest] brief: BRIEF_URL_SIGNING_SECRET not configured. Set BRIEF_COMPOSE_ENABLED=0 to silence intentionally.',
+    );
+    return { briefByUser, composeSuccess: 0, composeFailed: 1 };
+  }
+  if (!BRIEF_COMPOSE_ENABLED) return { briefByUser, composeSuccess: 0, composeFailed: 0 };
+
+  // The brief's story list now comes from the same digest accumulator
+  // the email reads (buildDigest). news:insights:v1 is still consulted
+  // for the global "clusters / multi-source" stat-page numbers, but no
+  // longer for the story list itself. A failed or empty insights fetch
+  // is NOT fatal — we fall back to zeroed numbers and still ship the
+  // brief, because the stories are what matter. (A mismatched brief
+  // was far worse than a brief with dashes on the stats page.)
+  let insightsNumbers = { clusters: 0, multiSource: 0 };
+  try {
+    const insightsRaw = await readRawJsonFromUpstash(INSIGHTS_KEY);
+    if (insightsRaw) insightsNumbers = extractInsights(insightsRaw).numbers;
+  } catch (err) {
+    console.warn('[digest] brief: insights read failed, using zeroed stats:', err.message);
+  }
+
+  // Memoize buildDigest by (variant, lang, windowStart). Many users
+  // share a variant/lang, so this saves ZRANGE + HGETALL round-trips
+  // across the per-user loop. Scoped to this cron run — no cross-run
+  // memoization needed (Redis is authoritative).
+  const windowStart = nowMs - BRIEF_STORY_WINDOW_MS;
+  const digestCache = new Map();
+  async function digestFor(candidate) {
+    const key = `${candidate.variant ?? 'full'}:${candidate.lang ?? 'en'}:${windowStart}`;
+    if (digestCache.has(key)) return digestCache.get(key);
+    const stories = await buildDigest(candidate, windowStart);
+    digestCache.set(key, stories ?? []);
+    return stories ?? [];
+  }
+
+  const eligibleByUser = groupEligibleRulesByUser(rules);
+  let composeSuccess = 0;
+  let composeFailed = 0;
+  for (const [userId, candidates] of eligibleByUser) {
+    try {
+      const hit = await composeAndStoreBriefForUser(userId, candidates, insightsNumbers, digestFor, nowMs);
+      if (hit) {
+        briefByUser.set(userId, hit);
+        composeSuccess++;
+      }
+    } catch (err) {
+      composeFailed++;
+      if (err instanceof BriefUrlError) {
+        console.warn(`[digest] brief: sign failed for ${userId} (${err.code}): ${err.message}`);
+      } else {
+        console.warn(`[digest] brief: compose failed for ${userId}:`, err.message);
+      }
+    }
+  }
+  console.log(
+    `[digest] brief: compose_success=${composeSuccess} compose_failed=${composeFailed} total_users=${eligibleByUser.size}`,
+  );
+  return { briefByUser, composeSuccess, composeFailed };
+}
+
+/**
+ * Per-user: walk candidates, for each pull the per-variant digest
+ * story pool (same pool buildDigest feeds to the email), and compose
+ * the brief envelope from the first candidate that yields non-empty
+ * stories. SETEX the envelope, sign the magazine URL. Returns the
+ * entry the caller should stash in briefByUser, or null when no
+ * candidate had stories.
+ */
+async function composeAndStoreBriefForUser(userId, candidates, insightsNumbers, digestFor, nowMs) {
+  let envelope = null;
+  let chosenVariant = null;
+  let chosenCandidate = null;
+  for (const candidate of candidates) {
+    const digestStories = await digestFor(candidate);
+    if (!digestStories || digestStories.length === 0) continue;
+    const composed = composeBriefFromDigestStories(
+      candidate,
+      digestStories,
+      insightsNumbers,
+      { nowMs },
+    );
+    if (composed) {
+      envelope = composed;
+      chosenVariant = candidate.variant;
+      chosenCandidate = candidate;
+      break;
+    }
+  }
+  if (!envelope) return null;
+
+  // Phase 3b — LLM enrichment. Substitutes the stubbed whyMatters /
+  // lead / threads / signals fields with Gemini 2.5 Flash output.
+  // Pure passthrough on any failure: the baseline envelope has
+  // already passed validation and is safe to ship as-is. Do NOT
+  // abort composition if the LLM is down; the stub is better than
+  // no brief.
+  if (BRIEF_LLM_ENABLED && chosenCandidate) {
+    const baseline = envelope;
+    try {
+      const enriched = await enrichBriefEnvelopeWithLLM(envelope, chosenCandidate, briefLlmDeps);
+      // Defence in depth: re-validate the enriched envelope against
+      // the renderer's strict contract before we SETEX it. If
+      // enrichment produced a structurally broken shape (bad cache
+      // row, code bug, upstream type drift) we'd otherwise SETEX it
+      // and /api/brief would 404 the user's brief at read time. Fall
+      // back to the unenriched baseline — which is already known to
+      // pass assertBriefEnvelope() because composeBriefFromDigestStories
+      // asserted on construction.
+      try {
+        assertBriefEnvelope(enriched);
+        envelope = enriched;
+      } catch (assertErr) {
+        console.warn(`[digest] brief: enriched envelope failed assertion for ${userId} — shipping stubbed:`, assertErr?.message);
+        envelope = baseline;
+      }
+    } catch (err) {
+      console.warn(`[digest] brief: LLM enrichment threw for ${userId} — shipping stubbed envelope:`, err?.message);
+      envelope = baseline;
+    }
+  }
+
+  const issueDate = envelope.data.date;
+  const key = `brief:${userId}:${issueDate}`;
+  const pipelineResult = await redisPipeline([
+    ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(envelope)],
+  ]);
+  if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length === 0) {
+    throw new Error('null pipeline response from Upstash');
+  }
+  const cell = pipelineResult[0];
+  if (cell && typeof cell === 'object' && 'error' in cell) {
+    throw new Error(`Upstash SETEX error: ${cell.error}`);
+  }
+
+  const magazineUrl = await signBriefUrl({
+    userId,
+    issueDate,
+    baseUrl: WORLDMONITOR_PUBLIC_BASE_URL,
+    secret: BRIEF_URL_SIGNING_SECRET,
+  });
+  return { envelope, magazineUrl, chosenVariant };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -855,6 +1194,14 @@ async function main() {
     console.log('[digest] No digest rules found — nothing to do');
     return;
   }
+
+  // Compose per-user brief envelopes once per run (extracted so main's
+  // complexity score stays in the biome budget). Failures MUST NOT
+  // block digest sends — we carry counters forward and apply the
+  // exit-non-zero gate AFTER the digest dispatch so Railway still
+  // surfaces compose-layer breakage without skipping user-visible
+  // digest delivery.
+  const { briefByUser, composeSuccess, composeFailed } = await composeBriefsForRun(rules, nowMs);
 
   let sentCount = 0;
 
@@ -919,8 +1266,15 @@ async function main() {
     if (!storyListPlain) continue;
     const htmlRaw = formatDigestHtml(stories, nowMs);
 
-    const { text, telegramText, slackText, discordText } = buildChannelBodies(storyListPlain, aiSummary);
-    const html = injectEmailSummary(htmlRaw, aiSummary);
+    const brief = briefByUser.get(rule.userId);
+    const magazineUrl = brief?.magazineUrl ?? null;
+    const { text, telegramText, slackText, discordText } = buildChannelBodies(
+      storyListPlain,
+      aiSummary,
+      magazineUrl,
+    );
+    const htmlWithSummary = injectEmailSummary(htmlRaw, aiSummary);
+    const html = injectBriefCta(htmlWithSummary, magazineUrl);
 
     const shortDate = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(new Date(nowMs));
     const subject = aiSummary ? `WorldMonitor Intelligence Brief — ${shortDate}` : `WorldMonitor Digest — ${shortDate}`;
@@ -930,6 +1284,14 @@ async function main() {
     for (const ch of deliverableChannels) {
       let ok = false;
       if (ch.channelType === 'telegram' && ch.chatId) {
+        // Phase 8: send the 3-image carousel first (best-effort), then
+        // the full text. Caption on the carousel is a short teaser —
+        // the long-form story list goes in the text message below so
+        // it remains forwardable / quotable on its own.
+        if (magazineUrl) {
+          const caption = `<b>WorldMonitor Brief — ${shortDate}</b>\n${stories.length} ${stories.length === 1 ? 'thread' : 'threads'} on the desk today.`;
+          await sendTelegramBriefCarousel(rule.userId, ch.chatId, caption, magazineUrl);
+        }
         ok = await sendTelegram(rule.userId, ch.chatId, telegramText);
       } else if (ch.channelType === 'slack' && ch.webhookEnvelope) {
         ok = await sendSlack(rule.userId, ch.webhookEnvelope, slackText);
@@ -955,6 +1317,18 @@ async function main() {
   }
 
   console.log(`[digest] Cron run complete: ${sentCount} digest(s) sent`);
+
+  // Brief-compose failure gate. Runs at the very end so a compose-
+  // layer outage (Upstash blip, insights key stale, signing secret
+  // missing) never blocks digest delivery to users — but Railway
+  // still flips the run red so ops see the signal. Denominator is
+  // attempted writes (shouldExitNonZero enforces this).
+  if (shouldExitOnBriefFailures({ success: composeSuccess, failed: composeFailed })) {
+    console.warn(
+      `[digest] brief: exiting non-zero — compose_failed=${composeFailed} compose_success=${composeSuccess} crossed the threshold`,
+    );
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {

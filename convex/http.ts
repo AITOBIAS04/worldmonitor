@@ -272,7 +272,7 @@ http.route({
 
     if (
       typeof body.userId !== "string" || !body.userId ||
-      (body.channelType !== "telegram" && body.channelType !== "slack" && body.channelType !== "email" && body.channelType !== "discord")
+      (body.channelType !== "telegram" && body.channelType !== "slack" && body.channelType !== "email" && body.channelType !== "discord" && body.channelType !== "web_push")
     ) {
       return new Response(JSON.stringify({ error: "MISSING_FIELDS" }), {
         status: 400,
@@ -367,6 +367,10 @@ http.route({
       slackConfigurationUrl?: string;
       discordGuildId?: string;
       discordChannelId?: string;
+      endpoint?: string;
+      p256dh?: string;
+      auth?: string;
+      userAgent?: string;
       quietHoursEnabled?: boolean;
       quietHoursStart?: number;
       quietHoursEnd?: number;
@@ -454,6 +458,20 @@ http.route({
           discordChannelId: body.discordChannelId,
         });
         return new Response(JSON.stringify({ ok: true, isNew: discordResult.isNew }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      if (action === "set-web-push") {
+        if (!body.endpoint || !body.p256dh || !body.auth) {
+          return new Response(JSON.stringify({ error: "endpoint, p256dh, auth required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+        const webPushResult = await ctx.runMutation((internal as any).notificationChannels.setWebPushChannelForUser, {
+          userId,
+          endpoint: body.endpoint,
+          p256dh: body.p256dh,
+          auth: body.auth,
+          userAgent: body.userAgent,
+        });
+        return new Response(JSON.stringify({ ok: true, isNew: webPushResult.isNew }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
 
       if (action === "delete-channel") {
@@ -634,6 +652,153 @@ http.route({
   }),
 });
 
+// ---------------------------------------------------------------------------
+// Referral code registration (Phase 9 / Todo #223)
+// ---------------------------------------------------------------------------
+
+// Edge-route companion for /api/referral/me. Binds a Clerk-derived
+// 8-char share code to the signed-in user's Clerk userId so future
+// /pro?ref=<code> signups can credit the sharer via the
+// userReferralCredits path in registerInterest:register. Auth is
+// server-to-server via RELAY_SHARED_SECRET — the edge route already
+// validated the caller's Clerk bearer before hitting this.
+http.route({
+  path: "/relay/register-referral-code",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const secret = process.env.RELAY_SHARED_SECRET ?? "";
+    const provided = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/, "");
+    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    let body: { userId?: string; code?: string };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return new Response(JSON.stringify({ error: "INVALID_BODY" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+    const code = typeof body.code === "string" ? body.code.trim() : "";
+    if (!userId || !code || code.length < 4 || code.length > 32) {
+      return new Response(JSON.stringify({ error: "userId + code required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const result = await ctx.runMutation(
+      (internal as any).registerInterest.registerUserReferralCode,
+      { userId, code },
+    );
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }),
+});
+
+// ---------------------------------------------------------------------------
+// User API key validation (service-to-service only)
+// ---------------------------------------------------------------------------
+
+// Service-to-service: validate a user API key by its SHA-256 hash.
+// Called by the Vercel edge gateway to look up user-owned keys.
+http.route({
+  path: "/api/internal-validate-api-key",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    let body: { keyHash?: unknown };
+    try {
+      body = await request.json() as { keyHash?: unknown };
+    } catch {
+      return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (typeof body.keyHash !== "string" || body.keyHash.length === 0) {
+      return new Response(JSON.stringify({ error: "MISSING_KEY_HASH" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const result = await ctx.runQuery(
+      (internal as any).apiKeys.validateKeyByHash,
+      { keyHash: body.keyHash },
+    );
+
+    if (result) {
+      // Fire-and-forget: update lastUsedAt (don't await, don't block response)
+      void ctx.runMutation((internal as any).apiKeys.touchKeyLastUsed, { keyId: result.id });
+    }
+
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }),
+});
+
+// Service-to-service: look up the owner of a key by hash (regardless of revoked status).
+// Used by the cache-invalidation endpoint to verify tenancy boundaries.
+http.route({
+  path: "/api/internal-get-key-owner",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const providedSecret = request.headers.get("x-convex-shared-secret") ?? "";
+    const expectedSecret = process.env.CONVEX_SERVER_SHARED_SECRET ?? "";
+    if (!expectedSecret || !(await timingSafeEqualStrings(providedSecret, expectedSecret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    let body: { keyHash?: unknown };
+    try {
+      body = await request.json() as { keyHash?: unknown };
+    } catch {
+      return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (typeof body.keyHash !== "string" || !/^[a-f0-9]{64}$/.test(body.keyHash)) {
+      return new Response(JSON.stringify({ error: "INVALID_KEY_HASH" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const result = await ctx.runQuery(
+      (internal as any).apiKeys.getKeyOwner,
+      { keyHash: body.keyHash },
+    );
+
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }),
+});
+
 http.route({
   path: "/dodopayments-webhook",
   method: "POST",
@@ -697,6 +862,24 @@ http.route({
           referralCode: body.referralCode,
         },
       );
+      if (
+        result &&
+        typeof result === "object" &&
+        "blocked" in result &&
+        result.blocked === true
+      ) {
+        return new Response(
+          JSON.stringify({
+            error: result.code,
+            message: result.message,
+            subscription: result.subscription,
+          }),
+          {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
       return new Response(JSON.stringify(result), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -705,6 +888,62 @@ http.route({
       const msg = err instanceof Error ? err.message : "Checkout creation failed";
       return new Response(JSON.stringify({ error: msg }), {
         status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }),
+});
+
+// Service-to-service: Vercel edge gateway creates Dodo customer portal sessions.
+// Authenticated via RELAY_SHARED_SECRET; edge endpoint validates Clerk JWT
+// and forwards the verified userId.
+http.route({
+  path: "/relay/customer-portal",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const secret = process.env.RELAY_SHARED_SECRET ?? "";
+    const provided = (request.headers.get("Authorization") ?? "").replace(
+      /^Bearer\s+/,
+      "",
+    );
+    if (!secret || !(await timingSafeEqualStrings(provided, secret))) {
+      return new Response(JSON.stringify({ error: "UNAUTHORIZED" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    let body: { userId?: string };
+    try {
+      body = await request.json() as typeof body;
+    } catch {
+      return new Response(JSON.stringify({ error: "INVALID_JSON" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (!body.userId) {
+      return new Response(
+        JSON.stringify({ error: "MISSING_FIELDS", required: ["userId"] }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    try {
+      const result = await ctx.runAction(
+        internal.payments.billing.internalGetCustomerPortalUrl,
+        { userId: body.userId },
+      );
+      return new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Customer portal creation failed";
+      const status = msg === "No Dodo customer found for this user" ? 404 : 500;
+      return new Response(JSON.stringify({ error: msg }), {
+        status,
         headers: { "Content-Type": "application/json" },
       });
     }

@@ -73,6 +73,7 @@ export interface TransitSummary {
   disruptionPct: number;
   riskSummary: string;
   riskReportAction: string;
+  dataAvailable: boolean;
 }
 
 export interface TransitDayCount {
@@ -100,6 +101,16 @@ export interface FlowEstimate {
   source: string;
   hazardAlertLevel: string;
   hazardAlertName: string;
+}
+
+export interface GetChokepointHistoryRequest {
+  chokepointId: string;
+}
+
+export interface GetChokepointHistoryResponse {
+  chokepointId: string;
+  history: TransitDayCount[];
+  fetchedAt: string;
 }
 
 export interface GetCriticalMineralsRequest {
@@ -413,6 +424,31 @@ export class SupplyChainServiceClient {
     }
 
     return await resp.json() as GetChokepointStatusResponse;
+  }
+
+  async getChokepointHistory(req: GetChokepointHistoryRequest, options?: SupplyChainServiceCallOptions): Promise<GetChokepointHistoryResponse> {
+    let path = "/api/supply-chain/v1/get-chokepoint-history";
+    const params = new URLSearchParams();
+    if (req.chokepointId != null && req.chokepointId !== "") params.set("chokepointId", String(req.chokepointId));
+    const url = this.baseURL + path + (params.toString() ? "?" + params.toString() : "");
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.defaultHeaders,
+      ...options?.headers,
+    };
+
+    const resp = await this.fetchFn(url, {
+      method: "GET",
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!resp.ok) {
+      return this.handleError(resp);
+    }
+
+    return await resp.json() as GetChokepointHistoryResponse;
   }
 
   async getCriticalMinerals(req: GetCriticalMineralsRequest, options?: SupplyChainServiceCallOptions): Promise<GetCriticalMineralsResponse> {

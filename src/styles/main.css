@@ -6205,6 +6205,114 @@ body.playback-mode .status-dot {
   opacity: 0.8;
 }
 
+/* 24/7 Positioning Panel */
+.pos-panel {
+  padding: 10px 14px;
+}
+
+.pos-section {
+  margin-bottom: 10px;
+}
+
+.pos-section__header {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.pos-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.pos-card {
+  background: var(--border);
+  border-radius: 4px;
+  padding: 8px 6px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+  border: 1px solid transparent;
+}
+
+.pos-card--elevated {
+  border-color: color-mix(in srgb, var(--pos-glow-color, #2ecc71) 40%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--pos-glow-color, #2ecc71) 25%, transparent);
+}
+
+.pos-card--clickable {
+  cursor: pointer;
+}
+
+.pos-card--clickable:hover {
+  border-color: color-mix(in srgb, var(--pos-glow-color, var(--text-dim)) 60%, transparent);
+}
+
+.pos-card__name {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.pos-gauge {
+  display: block;
+  margin: 0 auto;
+}
+
+.pos-card__metrics {
+  display: flex;
+  gap: 6px;
+  font-size: 9px;
+  margin-top: 2px;
+}
+
+.pos-badge {
+  font-size: 8px;
+  vertical-align: super;
+}
+
+.pos-badge--stale {
+  color: #e67e22;
+}
+
+.pos-badge--warmup {
+  color: #888;
+}
+
+.pos-warmup {
+  padding: 6px 8px;
+  background: rgba(230, 126, 34, 0.10);
+  color: #e67e22;
+  border-radius: 4px;
+  font-size: 10px;
+  margin-bottom: 8px;
+}
+
+.pos-footer {
+  margin-top: 6px;
+  font-size: 9px;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+@media (max-width: 600px) {
+  .pos-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 /* Predictions */
 .prediction-item {
   padding: 14px 16px;
@@ -21024,17 +21132,26 @@ body.map-width-resizing {
 
 .auth-signin-btn {
   padding: 6px 14px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--green);
   border-radius: 6px;
-  background: transparent;
-  color: var(--text);
+  background: var(--green);
+  /* Pinned dark, not var(--bg). In light theme var(--bg) is near-white and
+     falls to ~3.13:1 on var(--green), failing WCAG AA for 13px text. */
+  color: #0a0a0a;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
-  transition: opacity 0.15s;
+  transition: opacity 0.15s, box-shadow 0.15s;
 }
-.auth-signin-btn:hover { opacity: 0.85; }
+.auth-signin-btn:hover {
+  opacity: 0.9;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 35%, transparent);
+}
+.auth-signin-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 55%, transparent);
+}
 
 .auth-avatar-btn {
   width: 32px;
@@ -22726,6 +22843,167 @@ body.map-width-resizing {
 }
 
 .manage-billing-btn:hover { color: var(--text); }
+
+/* ---- API Keys Settings Tab ---- */
+
+.api-keys-section {
+  padding: 16px 0;
+}
+
+.api-keys-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+
+.api-keys-create-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.api-keys-name-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.api-keys-name-input:focus {
+  border-color: var(--accent);
+}
+
+.api-keys-name-input::placeholder {
+  color: var(--text-dim);
+}
+
+.api-keys-created-banner {
+  padding: 12px;
+  background: color-mix(in srgb, #22c55e 8%, transparent);
+  border: 1px solid color-mix(in srgb, #22c55e 25%, transparent);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.api-keys-banner-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #22c55e;
+  margin-bottom: 8px;
+}
+
+.api-keys-banner-key {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.api-keys-key-value {
+  flex: 1;
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface);
+  padding: 6px 10px;
+  border-radius: 4px;
+  word-break: break-all;
+  user-select: all;
+}
+
+.api-keys-error {
+  font-size: 12px;
+  color: var(--semantic-critical);
+  margin-bottom: 8px;
+}
+
+.api-keys-loading,
+.api-keys-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 16px 0;
+  text-align: center;
+}
+
+.api-keys-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.api-keys-item.revoked {
+  opacity: 0.5;
+}
+
+.api-keys-item-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.api-keys-item-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.api-keys-item-prefix {
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.api-keys-item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.api-keys-item-revoked-badge {
+  color: var(--semantic-critical);
+  font-weight: 600;
+}
+
+.api-keys-revoke-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  color: var(--semantic-critical);
+  flex-shrink: 0;
+}
+
+.api-keys-revoke-btn:hover {
+  background: color-mix(in srgb, var(--semantic-critical) 10%, transparent);
+}
+
+.api-keys-revoked-section {
+  margin-top: 16px;
+}
+
+.api-keys-revoked-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
 
 /* ---- Energy Crisis Panel ---- */
 

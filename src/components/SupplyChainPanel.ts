@@ -5,7 +5,8 @@ import type {
   GetCriticalMineralsResponse,
   GetShippingStressResponse,
 } from '@/services/supply-chain';
-import { fetchBypassOptions } from '@/services/supply-chain';
+import { fetchBypassOptions, fetchChokepointHistory } from '@/services/supply-chain';
+import type { TransitDayCount } from '@/services/supply-chain';
 import type { ScenarioResult } from '@/config/scenario-templates';
 import { SCENARIO_TEMPLATES } from '@/config/scenario-templates';
 import { TransitChart } from '@/utils/transit-chart';
@@ -32,6 +33,11 @@ export class SupplyChainPanel extends Panel {
   private transitChart = new TransitChart();
   private chartObserver: MutationObserver | null = null;
   private chartMountTimer: ReturnType<typeof setTimeout> | null = null;
+  // Session-scoped cache for lazy-loaded transit histories (keyed by chokepoint id).
+  // Populated on first card expand via fetchChokepointHistory; reused across re-renders
+  // so we don't refetch 35KB per expand/collapse cycle.
+  private historyCache = new Map<string, TransitDayCount[]>();
+  private historyInflight = new Set<string>();
   private bypassUnsubscribe: (() => void) | null = null;
   private bypassGateTracked = false;
   private onDismissScenario: (() => void) | null = null;
@@ -159,9 +165,46 @@ export class SupplyChainPanel extends Panel {
       const mountTransitChart = (): boolean => {
         const el = this.content.querySelector(`[data-chart-cp="${expandedCpName}"]`) as HTMLElement | null;
         if (!el) return false;
-        if (cp?.transitSummary?.history?.length) {
-          this.transitChart.mount(el, cp.transitSummary.history);
+        const cpId = cp?.id ?? '';
+        if (!cpId) { el.textContent = t('components.supplyChain.historyUnavailable') || 'History unavailable'; return true; }
+
+        const cached = this.historyCache.get(cpId);
+        if (cached && cached.length) {
+          el.removeAttribute('style');
+          el.style.marginTop = '8px';
+          el.style.minHeight = '200px';
+          el.textContent = '';
+          this.transitChart.mount(el, cached);
+          return true;
         }
+
+        // NOTE: we do NOT cache empty/error results — a transient deploy-window
+        // miss or a brief Redis error would otherwise poison the chokepoint for
+        // the entire session. Each re-expand retries; the /get-chokepoint-history
+        // gateway tier is "slow" (5-min CF edge cache) so retries stay cheap.
+
+        if (this.historyInflight.has(cpId)) return true;
+        this.historyInflight.add(cpId);
+        void fetchChokepointHistory(cpId).then(resp => {
+          this.historyInflight.delete(cpId);
+          // Still mounted? Re-query — DOM may have re-rendered since fetch started.
+          const liveEl = this.content.querySelector(`[data-chart-cp-id="${cpId}"]`) as HTMLElement | null;
+          if (!liveEl) return;
+          if (resp.history.length) {
+            this.historyCache.set(cpId, resp.history);
+            liveEl.removeAttribute('style');
+            liveEl.style.marginTop = '8px';
+            liveEl.style.minHeight = '200px';
+            liveEl.textContent = '';
+            this.transitChart.mount(liveEl, resp.history);
+          } else {
+            liveEl.textContent = t('components.supplyChain.historyUnavailable') || 'History unavailable';
+          }
+        }).catch(() => {
+          this.historyInflight.delete(cpId);
+          const liveEl = this.content.querySelector(`[data-chart-cp-id="${cpId}"]`) as HTMLElement | null;
+          if (liveEl) liveEl.textContent = t('components.supplyChain.historyUnavailable') || 'History unavailable';
+        });
         return true;
       };
 
@@ -299,8 +342,11 @@ export class SupplyChainPanel extends Panel {
         const actionRow = expanded && ts?.riskReportAction
           ? `<div class="sc-routing-advisory">${escapeHtml(ts.riskReportAction)}</div>`
           : '';
-        const chartPlaceholder = expanded && ts?.history?.length
-          ? `<div data-chart-cp="${escapeHtml(cp.name)}" style="margin-top:8px;min-height:200px"></div>`
+        // Render the chart placeholder only when expanded AND upstream reported
+        // data available for this chokepoint. If dataAvailable === false, the
+        // per-id history key would also be zero (we skip the lazy-fetch).
+        const chartPlaceholder = expanded && ts?.dataAvailable !== false
+          ? `<div data-chart-cp="${escapeHtml(cp.name)}" data-chart-cp-id="${escapeHtml(cp.id)}" style="margin-top:8px;min-height:200px;display:flex;align-items:center;justify-content:center;color:var(--text-dim,#888);font-size:12px">${t('components.supplyChain.loadingHistory') || 'Loading transit history\u2026'}</div>`
           : '';
 
         const tier = cp.warRiskTier ?? 'WAR_RISK_TIER_NORMAL';
@@ -350,7 +396,8 @@ export class SupplyChainPanel extends Panel {
               <span>${cp.activeWarnings} ${t('components.supplyChain.warnings')} · ${aisDisruptions} ${t('components.supplyChain.aisDisruptions')}</span>
               ${cp.directions?.length ? `<span>${cp.directions.map(d => escapeHtml(d)).join('/')}</span>` : ''}
             </div>
-            ${ts && (ts.todayTotal > 0 || hasWow || disruptPct > 0) ? `<div class="sc-metric-row">
+            ${ts && ts.dataAvailable === false ? `<div class="sc-metric-row" style="opacity:0.5;font-size:11px"><span>${t('components.supplyChain.transitDataUnavailable') || 'Transit data unavailable (upstream partial)'}</span></div>` : ''}
+            ${ts && ts.dataAvailable !== false && (ts.todayTotal > 0 || hasWow || disruptPct > 0) ? `<div class="sc-metric-row">
               ${ts.todayTotal > 0 ? `<span>${ts.todayTotal} ${t('components.supplyChain.vessels')}</span>` : ''}
               ${hasWow ? `<span>${t('components.supplyChain.wowChange')}: ${wowSpan}</span>` : ''}
               ${disruptPct > 0 ? `<span>${t('components.supplyChain.disruption')}: <span class="${disruptClass}">${disruptPct.toFixed(1)}%</span></span>` : ''}
@@ -672,18 +719,38 @@ export class SupplyChainPanel extends Panel {
     const scenarioId = trigger.dataset.scenarioId!;
     btn.disabled = true;
     btn.textContent = 'Computing\u2026';
+
+    // Guarantee the button never stays stuck at "Computing…" regardless of
+    // exit path. Prior logic early-returned on `signal.aborted` and
+    // `!this.content.isConnected` without ever re-enabling the button, and
+    // swallowed AbortError in the catch block. When the scenario-worker is
+    // down (no result key written in 24h), the polling loop DID fire a
+    // timeout but the abort paths above it leaked the stuck state.
+    const resetButton = (text: string) => {
+      // Only touch the button if it's still the same element in the DOM.
+      // A re-render may have replaced it — updating the detached node is
+      // invisible and harmless, but we skip to avoid confusion.
+      if (btn.isConnected) {
+        btn.textContent = text;
+        btn.disabled = false;
+      }
+    };
     try {
+      // Hard timeout on POST /run so a hanging edge function can't leave
+      // the button in "Computing…" indefinitely.
+      const runSignal = AbortSignal.any([signal, AbortSignal.timeout(20_000)]);
       const runResp = await premiumFetch('/api/scenario/v1/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenarioId }),
-        signal,
+        signal: runSignal,
       });
-      if (!runResp.ok) throw new Error('Run failed');
+      if (!runResp.ok) throw new Error(`Run failed: ${runResp.status}`);
       const { jobId } = await runResp.json() as { jobId: string };
       let result: ScenarioResult | null = null;
       for (let i = 0; i < 30; i++) {
-        if (signal.aborted || !this.content.isConnected) return;
+        if (signal.aborted) { resetButton('Simulate Closure'); return; }
+        if (!this.content.isConnected) return; // panel gone — nothing to update
         if (i > 0) await new Promise(r => setTimeout(r, 2000));
         const statusResp = await premiumFetch(`/api/scenario/v1/status?jobId=${encodeURIComponent(jobId)}`, { signal });
         if (!statusResp.ok) throw new Error(`Status poll failed: ${statusResp.status}`);
@@ -696,14 +763,20 @@ export class SupplyChainPanel extends Panel {
         }
         if (status.status === 'failed') throw new Error('Scenario failed');
       }
-      if (!result) throw new Error('Timeout');
-      if (signal.aborted || !this.content.isConnected) return;
+      if (!result) throw new Error('Timeout — scenario worker may be down');
+      if (signal.aborted) { resetButton('Simulate Closure'); return; }
+      if (!this.content.isConnected) return;
       this.onScenarioActivate?.(scenarioId, result);
-      btn.textContent = 'Active';
+      resetButton('Active');
+      btn.disabled = true; // active state stays disabled until user dismisses
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return;
-      btn.textContent = 'Error \u2014 retry';
-      btn.disabled = false;
+      // Abort from a new click = user-triggered retry, no error banner needed.
+      if (err instanceof Error && err.name === 'AbortError') {
+        resetButton('Simulate Closure');
+        return;
+      }
+      console.error('[scenario] run failed:', err);
+      resetButton('Error \u2014 retry');
     }
   }
 }

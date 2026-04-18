@@ -6,7 +6,15 @@ const SOCIAL_PREVIEW_UA =
 
 const SOCIAL_PREVIEW_PATHS = new Set(['/api/story', '/api/og-story']);
 
-const PUBLIC_API_PATHS = new Set(['/api/version', '/api/health']);
+// Paths that bypass bot/script UA filtering below. Each must carry its own
+// auth (API key, shared secret, or intentionally-public semantics) because
+// this list disables the middleware's generic bot gate.
+// - /api/version, /api/health: intentionally public, monitoring-friendly.
+// - /api/seed-contract-probe: requires RELAY_SHARED_SECRET header; called by
+//   UptimeRobot + ops curl. Was blocked by the curl/bot UA regex before this
+//   exception landed (Vercel log 2026-04-15: "Middleware 403 Forbidden" on
+//   /api/seed-contract-probe).
+const PUBLIC_API_PATHS = new Set(['/api/version', '/api/health', '/api/seed-contract-probe']);
 
 const SOCIAL_IMAGE_UA =
   /Slack-ImgProxy|Slackbot|twitterbot|facebookexternalhit|linkedinbot|telegrambot|whatsapp|discordbot|redditbot/i;
@@ -115,6 +123,22 @@ export default function middleware(request: Request) {
 
   // Public endpoints bypass all bot filtering
   if (PUBLIC_API_PATHS.has(path)) {
+    return;
+  }
+
+  // Authenticated Pro API clients bypass UA filtering. This is a cheap
+  // edge heuristic, not auth — real validation (SHA-256 hash vs Convex
+  // userApiKeys + entitlement) happens in server/gateway.ts. To keep the
+  // bot-UA shield meaningful, require the exact key shape emitted by
+  // src/services/api-keys.ts:generateKey: `wm_` + 40 lowercase hex chars.
+  // A random scraper would have to guess a specific 43-char format, and
+  // spoofed-but-well-shaped keys still 401 at the gateway.
+  const WM_KEY_SHAPE = /^wm_[a-f0-9]{40}$/;
+  const apiKey =
+    request.headers.get('x-worldmonitor-key') ??
+    request.headers.get('x-api-key') ??
+    '';
+  if (WM_KEY_SHAPE.test(apiKey)) {
     return;
   }
 

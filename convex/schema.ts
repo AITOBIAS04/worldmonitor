@@ -74,6 +74,23 @@ export default defineSchema({
         webhookLabel: v.optional(v.string()),
         webhookSecret: v.optional(v.string()),
       }),
+      // Web Push (Phase 6). endpoint+p256dh+auth are the standard
+      // PushSubscription identity triple — not secrets, just per-device
+      // pairing material (they identify the browser's push endpoint at
+      // Mozilla/Google/Apple). Stored plaintext to match the rest of
+      // this table. userAgent is cosmetic: lets the settings UI show
+      // "Chrome · MacOS" next to the Remove button so users can tell
+      // which device a subscription belongs to.
+      v.object({
+        userId: v.string(),
+        channelType: v.literal("web_push"),
+        endpoint: v.string(),
+        p256dh: v.string(),
+        auth: v.string(),
+        verified: v.boolean(),
+        linkedAt: v.number(),
+        userAgent: v.optional(v.string()),
+      }),
     ),
   )
     .index("by_user", ["userId"])
@@ -125,6 +142,32 @@ export default defineSchema({
     .index("by_normalized_email", ["normalizedEmail"])
     .index("by_referral_code", ["referralCode"]),
 
+  // Phase 9 / Todo #223 — Clerk-user referral codes.
+  // The `registrations.referralCode` column uses a 6-char hash of
+  // the registering email; share-button codes are an 8-char HMAC
+  // of the Clerk userId. Distinct spaces — this table resolves the
+  // Clerk-code space back to a userId so the register mutation can
+  // credit the right sharer when their code is used.
+  userReferralCodes: defineTable({
+    userId: v.string(),
+    code: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_user", ["userId"])
+    .index("by_code", ["code"]),
+
+  // Attribution rows written when a /pro?ref=<clerkCode> visitor
+  // signs up for the waitlist. One row per (referrer, referee email)
+  // pair. Kept separate from `registrations.referralCount` because
+  // the referrer has no registrations row to increment.
+  userReferralCredits: defineTable({
+    referrerUserId: v.string(),
+    refereeEmail: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_referrer", ["referrerUserId"])
+    .index("by_referrer_email", ["referrerUserId", "refereeEmail"]),
+
   contactMessages: defineTable({
     name: v.string(),
     email: v.string(),
@@ -169,6 +212,10 @@ export default defineSchema({
       exportFormats: v.array(v.string()),
     }),
     validUntil: v.number(),
+    // Optional complimentary-entitlement floor. When set and in the future,
+    // subscription.expired events skip the normal downgrade-to-free so
+    // goodwill credits outlive Dodo subscription cancellations.
+    compUntil: v.optional(v.number()),
     updatedAt: v.number(),
   }).index("by_userId", ["userId"]),
 
@@ -214,6 +261,18 @@ export default defineSchema({
   })
     .index("by_dodoProductId", ["dodoProductId"])
     .index("by_planKey", ["planKey"]),
+
+  userApiKeys: defineTable({
+    userId: v.string(),
+    name: v.string(),
+    keyPrefix: v.string(),        // first 8 chars of plaintext key, for display
+    keyHash: v.string(),          // SHA-256 hex digest — never store plaintext
+    createdAt: v.number(),
+    lastUsedAt: v.optional(v.number()),
+    revokedAt: v.optional(v.number()),
+  })
+    .index("by_userId", ["userId"])
+    .index("by_keyHash", ["keyHash"]),
 
   emailSuppressions: defineTable({
     normalizedEmail: v.string(),

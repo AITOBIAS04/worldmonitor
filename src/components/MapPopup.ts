@@ -12,7 +12,8 @@ import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
 import { isMobileDevice, getCSSColor } from '@/utils';
 import { TransitChart } from '@/utils/transit-chart';
 import { HS2RingChart } from '@/utils/hs2-ring-chart';
-import type { GetChokepointStatusResponse } from '@/services/supply-chain';
+import type { GetChokepointStatusResponse, TransitDayCount } from '@/services/supply-chain';
+import { fetchChokepointHistory } from '@/services/supply-chain';
 import { t } from '@/services/i18n';
 import { fetchHotspotContext, formatArticleDate, extractDomain, type GdeltArticle } from '@/services/gdelt-intel';
 import { getWingbitsLiveFlight } from '@/services/wingbits';
@@ -225,6 +226,10 @@ export class MapPopup {
   private repairShips: RepairShip[] = [];
   private chokepointData: GetChokepointStatusResponse | null = null;
   private transitChart: TransitChart | null = null;
+  // Session-scoped cache: history is now lazy-loaded via GetChokepointHistory
+  // when a waterway popup opens (main status RPC omits it to keep payloads small).
+  private static historyCache = new Map<string, TransitDayCount[]>();
+  private static historyInflight = new Set<string>();
   private isMobileSheet = false;
   private sheetTouchStartY: number | null = null;
   private sheetCurrentOffset = 0;
@@ -272,12 +277,50 @@ export class MapPopup {
         c => c.id === waterway.chokepointId,
       );
       const chartEl = this.popup.querySelector<HTMLElement>('[data-transit-chart]');
-      if (chartEl && cp?.transitSummary?.history?.length) {
-        this.transitChart = new TransitChart();
-        this.transitChart.mount(chartEl, cp.transitSummary.history);
+      const cpId = cp?.id ?? '';
+      const isPro = hasPremiumAccess(getAuthState());
+
+      if (chartEl && cpId && isPro) {
+        const cached = MapPopup.historyCache.get(cpId);
+        if (cached && cached.length) {
+          this.transitChart = new TransitChart();
+          this.transitChart.mount(chartEl, cached);
+        } else if (!MapPopup.historyInflight.has(cpId)) {
+          // We cache ONLY non-empty successful responses. An empty-array result
+          // or error is not cached, so re-opening the popup retries. Caching []
+          // would poison the chokepoint for the session — empty-array is
+          // truthy in JS, so `cached && cached.length` is false AND
+          // `!cached` is also false → neither branch fires, popup stuck on
+          // "Loading…". The /get-chokepoint-history gateway tier is "slow"
+          // (5-min CF edge cache) so retries stay cheap.
+          MapPopup.historyInflight.add(cpId);
+          void fetchChokepointHistory(cpId).then(resp => {
+            MapPopup.historyInflight.delete(cpId);
+            // Re-query keyed by cpId — if the user opened a different popup
+            // since this fetch started, the live [data-transit-chart] element
+            // belongs to the NEW chokepoint. Matching by id prevents mounting
+            // A's history into B's chart container.
+            const liveEl = this.popup?.querySelector<HTMLElement>(`[data-transit-chart-id="${cpId}"]`);
+            if (!liveEl) return;
+            if (resp.history.length) {
+              MapPopup.historyCache.set(cpId, resp.history);
+              liveEl.textContent = '';
+              this.transitChart = new TransitChart();
+              this.transitChart.mount(liveEl, resp.history);
+            } else {
+              liveEl.textContent = t('components.supplyChain.historyUnavailable') || 'History unavailable';
+            }
+          }).catch(() => {
+            MapPopup.historyInflight.delete(cpId);
+            const liveEl = this.popup?.querySelector<HTMLElement>(`[data-transit-chart-id="${cpId}"]`);
+            if (liveEl) liveEl.textContent = t('components.supplyChain.historyUnavailable') || 'History unavailable';
+          });
+        }
       }
-      // Track PRO gate impression for transit chart
-      if (cp?.transitSummary?.history?.length && !hasPremiumAccess(getAuthState())) {
+      // Track PRO gate impression for transit chart — we always render the gate
+      // for non-PRO users on chokepoints (history is a PRO feature); this
+      // doesn't depend on whether history has resolved.
+      if (cpId && !isPro) {
         trackGateHit('chokepoint-transit-chart');
       }
 
@@ -1293,7 +1336,11 @@ export class MapPopup {
     const cp = this.chokepointData?.chokepoints?.find(
       c => c.id === waterway.chokepointId,
     );
-    const hasChart = !!(cp?.transitSummary?.history?.length);
+    // Chart is lazy-loaded via GetChokepointHistory on popup mount. Render the
+    // section only when the chokepoint is known AND upstream flagged data
+    // available — a zero-state fill (partial portwatch) means the per-id
+    // history key is also empty, so there's nothing to fetch.
+    const hasChart = !!cp && cp.transitSummary?.dataAvailable !== false;
     const isPro = hasPremiumAccess(getAuthState());
     const sectors = CHOKEPOINT_HS2_SECTORS[waterway.chokepointId];
 
@@ -1307,7 +1354,7 @@ export class MapPopup {
     let chartSection = '';
     if (hasChart) {
       if (isPro) {
-        chartSection = `<div data-transit-chart="${escapeHtml(waterway.name)}" style="margin-top:10px;min-height:200px"></div>`;
+        chartSection = `<div data-transit-chart="${escapeHtml(waterway.name)}" data-transit-chart-id="${escapeHtml(cp?.id ?? '')}" style="margin-top:10px;min-height:200px;display:flex;align-items:center;justify-content:center;color:var(--text-dim,#888);font-size:12px">${t('components.supplyChain.loadingHistory') || 'Loading transit history\u2026'}</div>`;
       } else {
         chartSection = `
           <div class="sector-pro-gate" data-gate="chokepoint-transit-chart" style="position:relative;overflow:hidden;border-radius:6px;margin-top:10px;min-height:120px;background:var(--surface-elevated, #111)">

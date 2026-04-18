@@ -10,6 +10,7 @@ import type {
 export type { ScoreInterval };
 
 import { cachedFetchJson, getCachedJson, runRedisPipeline } from '../../../_shared/redis';
+import { unwrapEnvelope } from '../../../_shared/seed-envelope';
 import { detectTrend, round } from '../../../_shared/resilience-stats';
 import {
   RESILIENCE_DIMENSION_DOMAINS,
@@ -40,7 +41,13 @@ export const RESILIENCE_SCHEMA_V2_ENABLED =
   (process.env.RESILIENCE_SCHEMA_V2_ENABLED ?? 'true').toLowerCase() === 'true';
 
 export const RESILIENCE_SCORE_CACHE_TTL_SECONDS = 6 * 60 * 60;
-export const RESILIENCE_RANKING_CACHE_TTL_SECONDS = 6 * 60 * 60;
+// Ranking TTL must exceed the cron interval (6h) by enough to tolerate one
+// missed/slow cron tick. With TTL==cron_interval, writing near the end of a
+// run and firing the next cron near the start of the next interval left a
+// gap of multiple hours once the key expired between refreshes. 12h gives a
+// full cron-cycle of headroom — ensureRankingPresent() still refreshes on
+// every cron, so under normal operation the key stays well above TTL=0.
+export const RESILIENCE_RANKING_CACHE_TTL_SECONDS = 12 * 60 * 60;
 export const RESILIENCE_SCORE_CACHE_PREFIX = 'resilience:score:v9:';
 export const RESILIENCE_HISTORY_KEY_PREFIX = 'resilience:history:v4:';
 export const RESILIENCE_RANKING_CACHE_KEY = 'resilience:ranking:v9';
@@ -207,6 +214,68 @@ async function appendHistory(countryCode: string, overallScore: number): Promise
   ]);
 }
 
+// Pure compute: no caching, no Redis side-effects (except appendHistory, which
+// is part of the score semantics). Kept separate from `ensureResilienceScoreCached`
+// so the ranking warm path can persist with explicit write-verification via a
+// pipeline (see `warmMissingResilienceScores`) rather than trusting
+// `cachedFetchJson`'s log-and-swallow write semantics.
+async function buildResilienceScore(
+  normalizedCountryCode: string,
+  reader?: ResilienceSeedReader,
+): Promise<GetResilienceScoreResponse> {
+  const staticMeta = await getCachedJson(RESILIENCE_STATIC_META_KEY, true) as { fetchedAt?: number } | null;
+  const dataVersion = staticMeta?.fetchedAt
+    ? new Date(staticMeta.fetchedAt).toISOString().slice(0, 10)
+    : todayIsoDate();
+
+  const scoreMap = await scoreAllDimensions(normalizedCountryCode, reader);
+  const dimensions = buildDimensionList(scoreMap);
+  const domains = buildDomainList(dimensions);
+  const pillars = buildPillarList(domains, true);
+
+  const baselineDims: ResilienceDimension[] = [];
+  const stressDims: ResilienceDimension[] = [];
+  for (const dim of dimensions) {
+    const dimType = RESILIENCE_DIMENSION_TYPES[dim.id as ResilienceDimensionId];
+    if (dimType === 'baseline' || dimType === 'mixed') baselineDims.push(dim);
+    if (dimType === 'stress' || dimType === 'mixed') stressDims.push(dim);
+  }
+  const baselineScore = round(coverageWeightedMean(baselineDims));
+  const stressScore = round(coverageWeightedMean(stressDims));
+  const stressFactor = round(Math.max(0, Math.min(1 - stressScore / 100, 0.5)), 4);
+  const overallScore = round(domains.reduce((sum, d) => sum + d.score * d.weight, 0));
+
+  const totalImputed = dimensions.reduce((sum, d) => sum + (d.imputedWeight ?? 0), 0);
+  const totalObserved = dimensions.reduce((sum, d) => sum + (d.observedWeight ?? 0), 0);
+  const imputationShare = (totalImputed + totalObserved) > 0
+    ? round(totalImputed / (totalImputed + totalObserved), 4)
+    : 0;
+
+  const history = (await readHistory(normalizedCountryCode))
+    .filter((point) => point.date !== todayIsoDate());
+  const scoreSeries = [...history.map((point) => point.score), overallScore];
+  const oldestScore = history[0]?.score;
+
+  await appendHistory(normalizedCountryCode, overallScore);
+
+  return {
+    countryCode: normalizedCountryCode,
+    overallScore,
+    baselineScore,
+    stressScore,
+    stressFactor,
+    level: classifyResilienceLevel(overallScore),
+    domains,
+    trend: detectTrend(scoreSeries),
+    change30d: oldestScore == null ? 0 : round(overallScore - oldestScore),
+    lowConfidence: computeLowConfidence(dimensions, imputationShare),
+    imputationShare,
+    dataVersion,
+    pillars,
+    schemaVersion: '2.0',
+  };
+}
+
 export async function ensureResilienceScoreCached(countryCode: string, reader?: ResilienceSeedReader): Promise<GetResilienceScoreResponse> {
   const normalizedCountryCode = normalizeCountryCode(countryCode);
   if (!normalizedCountryCode) {
@@ -234,59 +303,7 @@ export async function ensureResilienceScoreCached(countryCode: string, reader?: 
   let cached = await cachedFetchJson<GetResilienceScoreResponse>(
     scoreCacheKey(normalizedCountryCode),
     RESILIENCE_SCORE_CACHE_TTL_SECONDS,
-    async () => {
-      const staticMeta = await getCachedJson(RESILIENCE_STATIC_META_KEY, true) as { fetchedAt?: number } | null;
-      const dataVersion = staticMeta?.fetchedAt
-        ? new Date(staticMeta.fetchedAt).toISOString().slice(0, 10)
-        : todayIsoDate();
-
-      const scoreMap = await scoreAllDimensions(normalizedCountryCode, reader);
-      const dimensions = buildDimensionList(scoreMap);
-      const domains = buildDomainList(dimensions);
-      const pillars = buildPillarList(domains, true);
-
-      const baselineDims: ResilienceDimension[] = [];
-      const stressDims: ResilienceDimension[] = [];
-      for (const dim of dimensions) {
-        const dimType = RESILIENCE_DIMENSION_TYPES[dim.id as ResilienceDimensionId];
-        if (dimType === 'baseline' || dimType === 'mixed') baselineDims.push(dim);
-        if (dimType === 'stress' || dimType === 'mixed') stressDims.push(dim);
-      }
-      const baselineScore = round(coverageWeightedMean(baselineDims));
-      const stressScore = round(coverageWeightedMean(stressDims));
-      const stressFactor = round(Math.max(0, Math.min(1 - stressScore / 100, 0.5)), 4);
-      const overallScore = round(domains.reduce((sum, d) => sum + d.score * d.weight, 0));
-
-      const totalImputed = dimensions.reduce((sum, d) => sum + (d.imputedWeight ?? 0), 0);
-      const totalObserved = dimensions.reduce((sum, d) => sum + (d.observedWeight ?? 0), 0);
-      const imputationShare = (totalImputed + totalObserved) > 0
-        ? round(totalImputed / (totalImputed + totalObserved), 4)
-        : 0;
-
-      const history = (await readHistory(normalizedCountryCode))
-        .filter((point) => point.date !== todayIsoDate());
-      const scoreSeries = [...history.map((point) => point.score), overallScore];
-      const oldestScore = history[0]?.score;
-
-      await appendHistory(normalizedCountryCode, overallScore);
-
-      return {
-        countryCode: normalizedCountryCode,
-        overallScore,
-        baselineScore,
-        stressScore,
-        stressFactor,
-        level: classifyResilienceLevel(overallScore),
-        domains,
-        trend: detectTrend(scoreSeries),
-        change30d: oldestScore == null ? 0 : round(overallScore - oldestScore),
-        lowConfidence: computeLowConfidence(dimensions, imputationShare),
-        imputationShare,
-        dataVersion,
-        pillars,
-        schemaVersion: '2.0',
-      };
-    },
+    () => buildResilienceScore(normalizedCountryCode, reader),
     300,
   ) ?? {
     countryCode: normalizedCountryCode,
@@ -344,7 +361,10 @@ export async function getCachedResilienceScores(countryCodes: string[]): Promise
     const raw = results[index]?.result;
     if (typeof raw !== 'string') continue;
     try {
-      const parsed = JSON.parse(raw) as GetResilienceScoreResponse;
+      // Envelope-aware: resilience score keys are written by seed-resilience-scores
+      // in contract mode (PR 2). unwrapEnvelope is a no-op on legacy bare-shape.
+      const parsed = unwrapEnvelope(JSON.parse(raw)).data as GetResilienceScoreResponse;
+      if (!parsed) continue;
       // P1 fix: cached payload is always v2 superset. Gate on serve.
       if (!RESILIENCE_SCHEMA_V2_ENABLED) {
         parsed.pillars = [];
@@ -406,26 +426,117 @@ export function sortRankingItems(items: ResilienceRankingItem[]): ResilienceRank
   });
 }
 
-export async function warmMissingResilienceScores(countryCodes: string[]): Promise<void> {
+// Warms the resilience score cache for the given countries and returns a map
+// of country-code → score for ONLY the scores whose writes actually landed in
+// Redis. Two subtle requirements:
+//
+//   1. Avoid the Upstash REST write→re-read visibility lag. A /pipeline GET of
+//      freshly-SET keys in the same Vercel invocation can return null even
+//      when every SET succeeded — the pre-existing post-warm re-read tripped
+//      this and silently dropped the ranking publish. See
+//      `feedback_upstash_write_reread_race_in_handler.md`.
+//   2. Still detect actual write failures. `cachedFetchJson`'s underlying
+//      `setCachedJson` only logs and swallows on error, which would make a
+//      transient /set failure look like a successful warm and publish a
+//      ranking aggregate over missing per-country keys.
+//
+// The pipeline SET response is the authoritative persistence signal: it's
+// synchronous with the write, so "result: OK" per command means the key is
+// actually stored. We compute scores in memory (no caching), persist in one
+// pipeline, and only include countries whose SET returned OK in the returned
+// map. Callers should merge the map directly into their local `cachedScores`
+// — no post-warm Redis re-read.
+export async function warmMissingResilienceScores(
+  countryCodes: string[],
+): Promise<Map<string, GetResilienceScoreResponse>> {
   const uniqueCodes = [...new Set(countryCodes.map((countryCode) => normalizeCountryCode(countryCode)).filter(Boolean))];
+  const warmed = new Map<string, GetResilienceScoreResponse>();
+  if (uniqueCodes.length === 0) return warmed;
+
   // Share one memoized reader across all countries so global Redis keys (conflict events,
   // sanctions, unrest, etc.) are fetched only once instead of once per country.
   const sharedReader = createMemoizedSeedReader();
-  const results = await Promise.allSettled(
-    uniqueCodes.map((countryCode) => ensureResilienceScoreCached(countryCode, sharedReader)),
+  const computed = await Promise.allSettled(
+    uniqueCodes.map(async (cc) => ({ cc, score: await buildResilienceScore(cc, sharedReader) })),
   );
-  const failures: Array<{ countryCode: string; reason: string }> = [];
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
-    if (result?.status === 'rejected') {
-      failures.push({
+
+  const scores: Array<{ cc: string; score: GetResilienceScoreResponse }> = [];
+  const computeFailures: Array<{ countryCode: string; reason: string }> = [];
+  for (let i = 0; i < computed.length; i++) {
+    const result = computed[i]!;
+    if (result.status === 'fulfilled') {
+      scores.push(result.value);
+    } else {
+      computeFailures.push({
         countryCode: uniqueCodes[i]!,
         reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
       });
     }
   }
-  if (failures.length > 0) {
-    const sample = failures.slice(0, 10).map((f) => `${f.countryCode}(${f.reason})`).join(', ');
-    console.warn(`[resilience] warm failed for ${failures.length}/${uniqueCodes.length} countries: ${sample}${failures.length > 10 ? '...' : ''}`);
+  if (computeFailures.length > 0) {
+    const sample = computeFailures.slice(0, 10).map((f) => `${f.countryCode}(${f.reason})`).join(', ');
+    console.warn(`[resilience] warm compute failed for ${computeFailures.length}/${uniqueCodes.length} countries: ${sample}${computeFailures.length > 10 ? '...' : ''}`);
   }
+  if (scores.length === 0) return warmed;
+
+  // Default `raw=false` so runRedisPipeline applies the env-based key prefix
+  // (`preview:<sha>:` on preview/dev, empty in production). The normal score
+  // reads (`getCachedResilienceScores`, `ensureResilienceScoreCached`) look in
+  // the prefixed namespace via setCachedJson/cachedFetchJson; writing raw here
+  // would (a) make preview warms invisible to subsequent preview reads and
+  // (b) leak preview writes into the production-visible unprefixed namespace.
+  //
+  // Chunk size: a single 222-SET pipeline pushes ~600KB of body and routinely
+  // exceeds REDIS_PIPELINE_TIMEOUT_MS (5s) on Vercel Edge → the runRedisPipeline
+  // call returns `[]`, the persistence guard correctly returns an empty map,
+  // and ranking publish gets dropped even though Upstash usually finishes the
+  // writes a moment later. Splitting into ~30-command batches keeps each
+  // pipeline body small enough to land well under the timeout while still
+  // making one round-trip per batch.
+  const SET_BATCH = 30;
+  const allSetCommands = scores.map(({ cc, score }) => [
+    'SET',
+    scoreCacheKey(cc),
+    JSON.stringify(score),
+    'EX',
+    String(RESILIENCE_SCORE_CACHE_TTL_SECONDS),
+  ]);
+  // Fire all batches concurrently. Serial awaits would add 7 extra Upstash
+  // round-trips for a 222-country warm (~100-500ms each on Edge). Each batch
+  // is independent, so Promise.all collapses them into a single wall-clock
+  // window bounded by the slowest batch. Failed batches still pad with empty
+  // entries to preserve per-command index alignment downstream.
+  const batches: Array<Array<Array<string>>> = [];
+  for (let i = 0; i < allSetCommands.length; i += SET_BATCH) {
+    batches.push(allSetCommands.slice(i, i + SET_BATCH));
+  }
+  const batchOutcomes = await Promise.all(batches.map((batch) => runRedisPipeline(batch)));
+  const persistResults: Array<{ result?: unknown }> = [];
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b]!;
+    const batchResults = batchOutcomes[b]!;
+    if (batchResults.length !== batch.length) {
+      // runRedisPipeline returns [] on transport/HTTP failure. Pad with
+      // empty entries so the per-command index alignment downstream stays
+      // correct — those entries will fail the OK check and be excluded
+      // from `warmed`, which is the safe behavior (no proof = no claim).
+      for (let j = 0; j < batch.length; j++) persistResults.push({});
+    } else {
+      for (const result of batchResults) persistResults.push(result);
+    }
+  }
+
+  let persistFailures = 0;
+  for (let i = 0; i < scores.length; i++) {
+    const { cc, score } = scores[i]!;
+    if (persistResults[i]?.result === 'OK') {
+      warmed.set(cc, score);
+    } else {
+      persistFailures++;
+    }
+  }
+  if (persistFailures > 0) {
+    console.warn(`[resilience] warm persisted ${warmed.size}/${scores.length} scores (${persistFailures} SETs did not return OK)`);
+  }
+  return warmed;
 }

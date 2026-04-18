@@ -15,10 +15,12 @@ const zlib = require('zlib');
 const path = require('path');
 const { readFileSync } = require('fs');
 const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
-const { parseProxyConfig } = require('./_proxy-utils.cjs');
+const { parseProxyConfig, resolveProxyString } = require('./_proxy-utils.cjs');
 const parseProxyUrl = parseProxyConfig;
 
 const httpsKeepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 6, timeout: 60_000 });
@@ -369,6 +371,51 @@ function upstashDel(key) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+// Seed envelope — canonical { _seed, data } shape. Mirrored from
+// scripts/_seed-envelope-source.mjs (ESM; can't be require()'d from CJS).
+// Source of truth lives there + api/_seed-envelope.js + server/_shared/seed-envelope.ts.
+// Parity enforced by scripts/verify-seed-envelope-parity.mjs.
+// ─────────────────────────────────────────────────────────────
+function buildEnvelope({ fetchedAt, recordCount, sourceVersion, schemaVersion, state, failedDatasets, errorReason, groupId, data }) {
+  const _seed = { fetchedAt, recordCount, sourceVersion, schemaVersion, state };
+  if (failedDatasets != null) _seed.failedDatasets = failedDatasets;
+  if (errorReason != null) _seed.errorReason = errorReason;
+  if (groupId != null) _seed.groupId = groupId;
+  return { _seed, data };
+}
+
+// Wrap `data` in a seed envelope and write to Redis at `key` with `ttlSeconds`.
+// meta: { recordCount, sourceVersion, schemaVersion?, state?, zeroOk? }
+//   - state: omit to derive ('OK_ZERO' when recordCount===0 && zeroOk, else 'OK')
+//   - schemaVersion: defaults to 1
+function envelopeWrite(key, data, ttlSeconds, meta) {
+  const recordCount = Number(meta?.recordCount ?? 0) || 0;
+  const state = meta?.state || (recordCount === 0 && meta?.zeroOk ? 'OK_ZERO' : 'OK');
+  const envelope = buildEnvelope({
+    fetchedAt: Date.now(),
+    recordCount,
+    sourceVersion: meta?.sourceVersion || 'ais-relay',
+    schemaVersion: meta?.schemaVersion ?? 1,
+    state,
+    data,
+  });
+  return upstashSet(key, envelope, ttlSeconds);
+}
+
+// Envelope-aware read. Mirrors server/_shared/redis.ts::getCachedJson semantics:
+// returns the bare payload for contract-mode canonical keys ({_seed, data}) and
+// passes legacy shapes through unchanged. MUST be used for any seeded canonical
+// key — reading raw via upstashGet() on an enveloped key iterates {_seed, data}
+// as payload keys and silently corrupts downstream consumers.
+async function envelopeRead(key) {
+  const raw = await upstashGet(key);
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && '_seed' in raw && 'data' in raw) {
+    return raw.data;
+  }
+  return raw;
+}
+
 function notifySimpleHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
@@ -593,6 +640,23 @@ function normalizeTelegramMessage(msg, channel) {
 
 let telegramPermanentlyDisabled = false;
 
+function destroyTelegramClient() {
+  const client = telegramState.client;
+  telegramState.client = null;
+  if (!client) return;
+  try { client.disconnect(); } catch {}
+  try {
+    if (client._sender) {
+      client._sender._reconnecting = false;
+      client._sender._autoReconnect = false;
+      if (client._sender._connection) {
+        try { client._sender._connection.socket?.destroy?.(); } catch {}
+        try { client._sender._connection.close?.(); } catch {}
+      }
+    }
+  } catch {}
+}
+
 async function initTelegramClientIfNeeded() {
   if (!TELEGRAM_ENABLED) return false;
   if (telegramState.client) return true;
@@ -604,11 +668,12 @@ async function initTelegramClientIfNeeded() {
 
   if (!apiId || !apiHash || !sessionStr) return false;
 
+  let client;
   try {
     const { TelegramClient } = await import('telegram');
     const { StringSession } = await import('telegram/sessions/index.js');
 
-    const client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
+    client = new TelegramClient(new StringSession(sessionStr), apiId, apiHash, {
       connectionRetries: 3,
     });
 
@@ -624,6 +689,13 @@ async function initTelegramClientIfNeeded() {
       telegramState.lastError = 'telegram package not installed';
       console.warn('[Relay] Telegram package not installed — disabling permanently for this session');
       return false;
+    }
+    // Destroy the locally-created client directly — telegramState.client
+    // is still null because connect() failed before the assignment. Without
+    // this, the MTProto sender's autonomous reconnect loop keeps running.
+    if (client) {
+      telegramState.client = client;
+      destroyTelegramClient();
     }
     if (/AUTH_KEY_DUPLICATED/.test(em)) {
       telegramPermanentlyDisabled = true;
@@ -705,8 +777,7 @@ async function pollTelegramOnce() {
         telegramPermanentlyDisabled = true;
         telegramState.lastError = 'session invalidated (AUTH_KEY_DUPLICATED) — generate a new TELEGRAM_SESSION';
         console.error('[Relay] Telegram session permanently invalidated (AUTH_KEY_DUPLICATED). Generate a new session with: node scripts/telegram/session-auth.mjs');
-        try { telegramState.client?.disconnect(); } catch {}
-        telegramState.client = null;
+        destroyTelegramClient();
         break;
       }
       if (/FLOOD_WAIT/.test(em)) {
@@ -732,6 +803,24 @@ async function pollTelegramOnce() {
   telegramState.lastPollAt = Date.now();
   const elapsed = ((Date.now() - pollStart) / 1000).toFixed(1);
   console.log(`[Relay] Telegram poll: ${channelsPolled}/${channels.length} channels, ${newItems.length} new msgs, ${telegramState.items.length} total, ${channelsFailed} errors, ${mediaSkipped} media-only skipped (${elapsed}s)`);
+
+  if (channelsPolled > 0) {
+    const rc = telegramState.items.length;
+    // Data key TTL must outlive maxStaleMin (10 min = 600s) by enough
+    // buffer so health sees hasData=true + stale seed-meta → STALE_SEED.
+    // If both keys expire together, health jumps straight to EMPTY and
+    // the stale window is never visible. 1800s (30 min) data vs 900s
+    // (15 min) meta gives a 15-min STALE_SEED window before EMPTY.
+    upstashSet('intelligence:telegram-feed:v1', {
+      count: rc,
+      updatedAt: new Date().toISOString(),
+      enabled: true,
+    }, 1800).catch(() => {});
+    upstashSet('seed-meta:intelligence:telegram-feed:v1', {
+      fetchedAt: Date.now(),
+      recordCount: rc,
+    }, 900).catch(() => {});
+  }
 }
 
 let telegramPollInFlight = false;
@@ -754,7 +843,7 @@ function guardedTelegramPoll() {
     .finally(() => { telegramPollInFlight = false; });
 }
 
-const TELEGRAM_STARTUP_DELAY_MS = Math.max(0, Number(process.env.TELEGRAM_STARTUP_DELAY_MS || 60_000));
+const TELEGRAM_STARTUP_DELAY_MS = Math.max(0, Number(process.env.TELEGRAM_STARTUP_DELAY_MS || 120_000));
 
 function startTelegramPollLoop() {
   if (!TELEGRAM_ENABLED) return;
@@ -1083,7 +1172,7 @@ async function orefPersistHistory() {
       activeAlertCount: orefState.lastAlerts?.length || 0,
       persistedAt: new Date().toISOString(),
     };
-    const ok = await upstashSet(OREF_REDIS_KEY, payload, OREF_PERSIST_TTL_SECONDS);
+    const ok = await envelopeWrite(OREF_REDIS_KEY, payload, OREF_PERSIST_TTL_SECONDS, { recordCount: waves.length, sourceVersion: 'oref', zeroOk: true });
     if (ok) {
       orefState._lastPersistedVersion = versionAtStart;
     }
@@ -1164,7 +1253,10 @@ async function orefBootstrapHistoryWithRetry() {
 
   // Phase 1: try Redis first
   try {
-    const cached = await upstashGet(OREF_REDIS_KEY);
+    // envelopeRead unwraps the {_seed, data} shape written by orefPersistHistory()
+    // at line 1133. Reading raw left cached.history undefined, so OREF state was
+    // never restored across relay restarts (reported in PR #3139 review).
+    const cached = await envelopeRead(OREF_REDIS_KEY);
     if (cached && Array.isArray(cached.history) && cached.history.length > 0) {
       const valid = cached.history.every(
         h => Array.isArray(h.alerts) && typeof h.timestamp === 'string'
@@ -1364,7 +1456,7 @@ async function seedUcdpEvents() {
     }
 
     const payload = { events: mapped, fetchedAt: Date.now(), version, totalRaw: allEvents.length, filteredCount: mapped.length };
-    const ok = await upstashSet(UCDP_REDIS_KEY, payload, UCDP_TTL_SECONDS);
+    const ok = await envelopeWrite(UCDP_REDIS_KEY, payload, UCDP_TTL_SECONDS, { recordCount: mapped.length, sourceVersion: 'ucdp' });
     await upstashSet('seed-meta:conflict:ucdp-events', { fetchedAt: Date.now(), recordCount: mapped.length }, 604800);
     console.log(`[UCDP] Seeded ${mapped.length} events (raw: ${allEvents.length}, failed pages: ${failedPages}, redis: ${ok ? 'OK' : 'FAIL'})`);
     const newConflicts = mapped.filter(e => e.deathsBest >= 10 && !ucdpPrevAlertedIds.has(e.id)).sort((a, b) => b.deathsBest - a.deathsBest);
@@ -1506,7 +1598,7 @@ async function seedSatelliteTLEs() {
     }
 
     const payload = { satellites, fetchedAt: Date.now() };
-    const ok = await upstashSet('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL);
+    const ok = await envelopeWrite('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL, { recordCount: satellites.length, sourceVersion: 'celestrak' });
     await upstashSet('seed-meta:intelligence:satellites', { fetchedAt: Date.now(), recordCount: satellites.length }, 604800);
     console.log(`[Satellites] Seeded ${satellites.length} TLEs (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -1578,9 +1670,14 @@ function _parseYahooChartJson(body) {
   } catch { return null; }
 }
 
-let _yahooProxyFailCount = 0;
+// Two independent Decodo egress pools → two independent cooldowns. Yahoo may
+// block one while the other is healthy (2026-04-16: CONNECT blocked, curl OK).
+// Sharing state would let one route's outage suppress the working route.
 const _YAHOO_PROXY_COOLDOWN_MS = 5 * 60 * 1000;
-let _yahooProxyCooldownUntil = 0;
+let _yahooConnectProxyFailCount = 0;   // fetchYahooChartDirect via gate.decodo.com (CONNECT)
+let _yahooConnectProxyCooldownUntil = 0;
+let _yahooCurlProxyFailCount = 0;      // fetchYahooQuoteSummary via us.decodo.com (curl)
+let _yahooCurlProxyCooldownUntil = 0;
 
 function _fetchYahooChartNoProxy(symbol) {
   return new Promise((resolve) => {
@@ -1607,29 +1704,36 @@ function fetchYahooChartDirect(symbol) {
   return _fetchYahooChartNoProxy(symbol).then((result) => {
     if (result) return result;
     if (!PROXY_URL) return null;
-    if (Date.now() < _yahooProxyCooldownUntil) return null;
+    if (Date.now() < _yahooConnectProxyCooldownUntil) return null;
     const proxy = { ...parseProxyUrl(PROXY_URL), tls: true };
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
     return ytFetchViaProxy(url, proxy).then((resp) => {
       if (!resp?.ok) {
-        _yahooProxyFailCount++;
-        if (_yahooProxyFailCount >= 5) {
-          _yahooProxyCooldownUntil = Date.now() + _YAHOO_PROXY_COOLDOWN_MS;
-          _yahooProxyFailCount = 0;
-          logThrottled('warn', 'market-yahoo-proxy-cooldown', '[Market] Yahoo proxy cooldown 5min after 5 failures');
+        _yahooConnectProxyFailCount++;
+        if (_yahooConnectProxyFailCount >= 5) {
+          _yahooConnectProxyCooldownUntil = Date.now() + _YAHOO_PROXY_COOLDOWN_MS;
+          _yahooConnectProxyFailCount = 0;
+          logThrottled('warn', 'market-yahoo-proxy-cooldown', '[Market] Yahoo CONNECT proxy cooldown 5min after 5 failures');
         }
         return null;
       }
-      _yahooProxyFailCount = 0;
+      _yahooConnectProxyFailCount = 0;
       return _parseYahooChartJson(resp.body);
     }).catch(() => null);
   });
 }
 
+// Yahoo's /v10 quoteSummary 401s on Railway container IPs (seen 2026-04-16
+// logs — all 12 sector ETFs failing). Direct first, then curl via Decodo
+// us.decodo.com. Must be curl (NOT CONNECT): Yahoo's edge blocks Decodo's
+// CONNECT egress (gate.decodo.com) but accepts the curl egress — probed
+// 2026-04-16, see scripts/_yahoo-fetch.mjs header.
 function fetchYahooQuoteSummary(symbol) {
   return new Promise((resolve) => {
     const modules = 'summaryDetail,defaultKeyStatistics';
     const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`;
+    let settled = false;
+    const settle = (value) => { if (settled) return; settled = true; resolve(value); };
     const req = https.get(url, {
       headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
       timeout: 12000,
@@ -1637,7 +1741,7 @@ function fetchYahooQuoteSummary(symbol) {
       if (resp.statusCode !== 200) {
         resp.resume();
         logThrottled('warn', `yahoo-summary-${resp.statusCode}:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} HTTP ${resp.statusCode}`);
-        return resolve(null);
+        return settle(_yahooQuoteSummaryProxyFallback(symbol, url));
       }
       let body = '';
       resp.on('data', (chunk) => { body += chunk; });
@@ -1645,11 +1749,11 @@ function fetchYahooQuoteSummary(symbol) {
         try {
           const data = JSON.parse(body);
           const result = data?.quoteSummary?.result?.[0];
-          if (!result) return resolve(null);
+          if (!result) return settle(null); // app-level "no data" — proxy won't change it
           const sd = result.summaryDetail || {};
           const ks = result.defaultKeyStatistics || {};
           const raw = (obj) => typeof obj === 'object' && obj !== null ? (obj.raw ?? obj.fmt ?? null) : (typeof obj === 'number' ? obj : null);
-          resolve({
+          settle({
             trailingPE: raw(sd.trailingPE),
             forwardPE: raw(sd.forwardPE),
             beta: raw(sd.beta) ?? raw(ks.beta3Year),
@@ -1657,12 +1761,75 @@ function fetchYahooQuoteSummary(symbol) {
             threeYearReturn: raw(ks.threeYearAverageReturn),
             fiveYearReturn: raw(ks.fiveYearAverageReturn),
           });
-        } catch { resolve(null); }
+        } catch { settle(_yahooQuoteSummaryProxyFallback(symbol, url)); }
       });
     });
-    req.on('error', (err) => { logThrottled('warn', `yahoo-summary-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} error: ${err.message}`); resolve(null); });
-    req.on('timeout', () => { req.destroy(); logThrottled('warn', `yahoo-summary-timeout:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} timeout`); resolve(null); });
+    req.on('error', (err) => { if (settled) return; logThrottled('warn', `yahoo-summary-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} error: ${err.message}`); settle(_yahooQuoteSummaryProxyFallback(symbol, url)); });
+    req.on('timeout', () => { if (settled) return; req.destroy(); logThrottled('warn', `yahoo-summary-timeout:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} timeout`); settle(_yahooQuoteSummaryProxyFallback(symbol, url)); });
   });
+}
+
+// Async so the curl call doesn't block the relay event loop. Returns a
+// Promise; resolve(promise) in the caller chains the Promise state through
+// to fetchYahooQuoteSummary's outer Promise, so awaiting fetchYahoo* in
+// seedSectorSummary yields the event loop during the curl round-trip.
+async function _yahooQuoteSummaryProxyFallback(symbol, url) {
+  const proxyAuth = resolveProxyString();
+  if (!proxyAuth) return null;
+  if (Date.now() < _yahooCurlProxyCooldownUntil) return null;
+  // Transport failures (timeout, proxy-connect refused, garbage body) must
+  // tick the cooldown too — the failure mode this PR hardens against would
+  // otherwise thrash through N curl attempts per tick with no backoff.
+  const bumpCooldown = () => {
+    _yahooCurlProxyFailCount++;
+    if (_yahooCurlProxyFailCount >= 5) {
+      _yahooCurlProxyCooldownUntil = Date.now() + _YAHOO_PROXY_COOLDOWN_MS;
+      _yahooCurlProxyFailCount = 0;
+      logThrottled('warn', 'sector-yahoo-proxy-cooldown', '[Sector] Yahoo curl proxy cooldown 5min after 5 failures');
+    }
+  };
+  try {
+    const args = [
+      '-sS', '--compressed', '--max-time', '15', '-L',
+      '-x', `http://${proxyAuth}`,
+      '-H', `User-Agent: ${CHROME_UA}`,
+      '-H', 'Accept: application/json',
+      '-w', '\n%{http_code}',
+      url,
+    ];
+    const { stdout } = await execFileAsync('curl', args, { encoding: 'utf8', timeout: 20000 });
+    const nl = stdout.lastIndexOf('\n');
+    const status = parseInt(stdout.slice(nl + 1).trim(), 10);
+    if (status < 200 || status >= 300) {
+      bumpCooldown();
+      logThrottled('warn', `sector-yahoo-proxy-${status}:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} proxy HTTP ${status}`);
+      return null;
+    }
+    const data = JSON.parse(stdout.slice(0, nl));
+    const result = data?.quoteSummary?.result?.[0];
+    if (!result) {
+      // Proxy reached Yahoo and got a valid 200 — route is healthy. Reset
+      // the counter even if this specific symbol has no data.
+      _yahooCurlProxyFailCount = 0;
+      return null;
+    }
+    _yahooCurlProxyFailCount = 0;
+    const sd = result.summaryDetail || {};
+    const ks = result.defaultKeyStatistics || {};
+    const raw = (obj) => typeof obj === 'object' && obj !== null ? (obj.raw ?? obj.fmt ?? null) : (typeof obj === 'number' ? obj : null);
+    return {
+      trailingPE: raw(sd.trailingPE),
+      forwardPE: raw(sd.forwardPE),
+      beta: raw(sd.beta) ?? raw(ks.beta3Year),
+      ytdReturn: raw(ks.ytdReturn),
+      threeYearReturn: raw(ks.threeYearAverageReturn),
+      fiveYearReturn: raw(ks.fiveYearAverageReturn),
+    };
+  } catch (err) {
+    bumpCooldown();
+    logThrottled('warn', `sector-yahoo-proxy-err:${symbol}`, `[Sector] Yahoo quoteSummary ${symbol} proxy error: ${err.message}`);
+    return null;
+  }
 }
 
 function parseSectorValuation(raw) {
@@ -1740,9 +1907,9 @@ async function seedMarketQuotes() {
   const skipped = !FINNHUB_API_KEY && !coveredByYahoo;
   const payload = { quotes, finnhubSkipped: skipped, skipReason: skipped ? 'FINNHUB_API_KEY not configured' : '', rateLimited: false };
   const redisKey = `market:quotes:v1:${[...MARKET_SYMBOLS].sort().join(',')}`;
-  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  const ok = await envelopeWrite(redisKey, payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-stocks' });
   // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
-  const ok2 = await upstashSet('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-stocks' });
   const ok3 = await upstashSet('seed-meta:market:stocks', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Market] Seeded ${quotes.length}/${MARKET_SYMBOLS.length} quotes (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   const movingStocks = quotes.filter(q => Math.abs(q.change ?? 0) >= 5).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -1789,14 +1956,14 @@ async function seedCommodityQuotes() {
 
   const payload = { quotes };
   const redisKey = `market:commodities:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
-  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  const ok = await envelopeWrite(redisKey, payload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   // Also write under market:quotes:v1: key — the frontend routes commodities through
   // listMarketQuotes RPC, which constructs this key pattern (not market:commodities:v1:)
   const quotesKey = `market:quotes:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
   const quotesPayload = { quotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
-  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite(quotesKey, quotesPayload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
-  const ok3 = await upstashSet('market:commodities-bootstrap:v1', quotesPayload, MARKET_SEED_TTL);
+  const ok3 = await envelopeWrite('market:commodities-bootstrap:v1', quotesPayload, MARKET_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-commodities' });
   const ok4 = await upstashSet('seed-meta:market:commodities', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Market] Seeded ${quotes.length}/${COMMODITY_SYMBOLS.length} commodities (redis: ${ok && ok2 && ok3 && ok4 ? 'OK' : 'PARTIAL'})`);
   const movingCommodities = quotes.filter(q => Math.abs(q.change ?? 0) >= 5).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -1848,14 +2015,14 @@ async function seedSectorSummary() {
   }
 
   const payload = { sectors, valuations };
-  const ok = await upstashSet('market:sectors:v2', payload, MARKET_SEED_TTL);
+  const ok = await envelopeWrite('market:sectors:v2', payload, MARKET_SEED_TTL, { recordCount: sectors.length, sourceVersion: 'market-sectors' });
   const quotesKey = `market:quotes:v1:${[...SECTOR_SYMBOLS].sort().join(',')}`;
   const sectorQuotes = sectors.map((s) => ({
     symbol: s.symbol, name: s.name, display: s.name,
     price: 0, change: s.change, sparkline: [],
   }));
   const quotesPayload = { quotes: sectorQuotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
-  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  const ok2 = await envelopeWrite(quotesKey, quotesPayload, MARKET_SEED_TTL, { recordCount: sectorQuotes.length, sourceVersion: 'market-sectors' });
   const ok3 = await upstashSet('seed-meta:market:sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
   console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors, ${valCount} valuations (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
@@ -1895,7 +2062,7 @@ async function seedGulfQuotes() {
   }
   if (quotes.length === 0) { console.warn('[Gulf] No quotes fetched — skipping'); return 0; }
   const payload = { quotes, rateLimited: false };
-  const ok1 = await upstashSet('market:gulf-quotes:v1', payload, GULF_SEED_TTL);
+  const ok1 = await envelopeWrite('market:gulf-quotes:v1', payload, GULF_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-gulf' });
   const ok2 = await upstashSet('seed-meta:market:gulf-quotes', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Gulf] Seeded ${quotes.length}/${GULF_SYMBOLS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return quotes.length;
@@ -1955,7 +2122,7 @@ async function seedEtfFlows() {
     summary: { etfCount: etfs.length, totalVolume, totalEstFlow, netDirection: totalEstFlow > 0 ? 'NET INFLOW' : totalEstFlow < 0 ? 'NET OUTFLOW' : 'NEUTRAL', inflowCount: etfs.filter((e) => e.direction === 'inflow').length, outflowCount: etfs.filter((e) => e.direction === 'outflow').length },
     etfs, rateLimited: false,
   };
-  const ok1 = await upstashSet('market:etf-flows:v1', payload, ETF_SEED_TTL);
+  const ok1 = await envelopeWrite('market:etf-flows:v1', payload, ETF_SEED_TTL, { recordCount: etfs.length, sourceVersion: 'market-etf-flows' });
   const ok2 = await upstashSet('seed-meta:market:etf-flows', { fetchedAt: Date.now(), recordCount: etfs.length }, 604800);
   console.log(`[ETF] Seeded ${etfs.length}/${ETF_LIST.length} ETFs (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return etfs.length;
@@ -2026,7 +2193,7 @@ async function seedCryptoQuotes() {
     quotes.push({ name: meta?.name || id, symbol: meta?.symbol || id.toUpperCase(), price: coin.current_price ?? 0, change: coin.price_change_percentage_24h ?? 0, sparkline: prices && prices.length > 24 ? prices.slice(-48) : (prices || []) });
   }
   if (quotes.length === 0 || quotes.every((q) => q.price === 0)) { console.warn('[Crypto] No valid quotes — skipping'); return 0; }
-  const ok1 = await upstashSet('market:crypto:v1', { quotes }, CRYPTO_SEED_TTL);
+  const ok1 = await envelopeWrite('market:crypto:v1', { quotes }, CRYPTO_SEED_TTL, { recordCount: quotes.length, sourceVersion: 'market-crypto' });
   const ok2 = await upstashSet('seed-meta:market:crypto', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
   console.log(`[Crypto] Seeded ${quotes.length}/${CRYPTO_IDS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   const movingCrypto = quotes.filter(q => Math.abs(q.change ?? 0) >= 10).sort((a, b) => Math.abs(b.change) - Math.abs(a.change));
@@ -2087,7 +2254,7 @@ async function seedStablecoinMarkets() {
   const totalVolume24h = stablecoins.reduce((s, c) => s + c.volume24h, 0);
   const depeggedCount = stablecoins.filter((c) => c.pegStatus === 'DEPEGGED').length;
   const payload = { timestamp: new Date().toISOString(), summary: { totalMarketCap, totalVolume24h, coinCount: stablecoins.length, depeggedCount, healthStatus: depeggedCount === 0 ? 'HEALTHY' : depeggedCount === 1 ? 'CAUTION' : 'WARNING' }, stablecoins };
-  const ok1 = await upstashSet('market:stablecoins:v1', payload, STABLECOIN_SEED_TTL);
+  const ok1 = await envelopeWrite('market:stablecoins:v1', payload, STABLECOIN_SEED_TTL, { recordCount: stablecoins.length, sourceVersion: 'market-stablecoins' });
   const ok2 = await upstashSet('seed-meta:market:stablecoins', { fetchedAt: Date.now(), recordCount: stablecoins.length }, 604800);
   console.log(`[Stablecoin] Seeded ${stablecoins.length} coins (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return stablecoins.length;
@@ -2129,7 +2296,7 @@ async function seedCryptoSectors() {
     const change = changes.length > 0 ? changes.reduce((a, b) => a + b, 0) / changes.length : 0;
     return { id: sector.id, name: sector.name, change };
   });
-  const ok1 = await upstashSet('market:crypto-sectors:v1', { sectors }, SECTORS_SEED_TTL);
+  const ok1 = await envelopeWrite('market:crypto-sectors:v1', { sectors }, SECTORS_SEED_TTL, { recordCount: sectors.length, sourceVersion: 'market-crypto-sectors' });
   const ok2 = await upstashSet('seed-meta:market:crypto-sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
   console.log(`[CryptoSectors] Seeded ${sectors.length} sectors (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
   return sectors.length;
@@ -2196,9 +2363,9 @@ async function seedTokenPanels() {
     console.warn('[TokenPanels] All panels empty after mapping — skipping Redis write to preserve cached data');
     return 0;
   }
-  const ok1 = await upstashSet('market:defi-tokens:v1', defi, TOKEN_PANELS_SEED_TTL);
-  const ok2 = await upstashSet('market:ai-tokens:v1', ai, TOKEN_PANELS_SEED_TTL);
-  const ok3 = await upstashSet('market:other-tokens:v1', other, TOKEN_PANELS_SEED_TTL);
+  const ok1 = await envelopeWrite('market:defi-tokens:v1', defi, TOKEN_PANELS_SEED_TTL, { recordCount: defi.tokens.length, sourceVersion: 'market-defi-tokens' });
+  const ok2 = await envelopeWrite('market:ai-tokens:v1', ai, TOKEN_PANELS_SEED_TTL, { recordCount: ai.tokens.length, sourceVersion: 'market-ai-tokens' });
+  const ok3 = await envelopeWrite('market:other-tokens:v1', other, TOKEN_PANELS_SEED_TTL, { recordCount: other.tokens.length, sourceVersion: 'market-other-tokens' });
   await upstashSet('seed-meta:market:token-panels', { fetchedAt: Date.now(), recordCount: defi.tokens.length + ai.tokens.length + other.tokens.length }, 604800);
   const total = defi.tokens.length + ai.tokens.length + other.tokens.length;
   const allOk = ok1 && ok2 && ok3;
@@ -2495,7 +2662,7 @@ async function seedAviationDelays() {
       return;
     }
 
-    const ok = await upstashSet(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL);
+    const ok = await envelopeWrite(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL, { recordCount: alerts.length, sourceVersion: 'aviationstack' });
     await upstashSet('seed-meta:aviation:intl', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
     console.log(`[Aviation] Seeded ${alerts.length} alerts (${succeeded} ok, ${failed} failed, redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const severeAlerts = alerts.filter(a =>
@@ -2673,7 +2840,7 @@ async function seedNotamClosures() {
 
   const closedIcaos = [...closedSet];
   const payload = { closedIcaos, reasons };
-  const ok = await upstashSet(NOTAM_REDIS_KEY, payload, NOTAM_SEED_TTL);
+  const ok = await envelopeWrite(NOTAM_REDIS_KEY, payload, NOTAM_SEED_TTL, { recordCount: closedIcaos.length, sourceVersion: 'icao-notam', zeroOk: true });
   await upstashSet('seed-meta:aviation:notam', { fetchedAt: Date.now(), recordCount: closedIcaos.length }, 604800);
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
   console.log(`[NOTAM-Seed] ${notams.length} raw NOTAMs, ${closedIcaos.length} closures (redis: ${ok ? 'OK' : 'FAIL'}) in ${elapsed}s`);
@@ -3057,8 +3224,8 @@ async function seedCyberThreats() {
     }
 
     const payload = { threats };
-    const ok1 = await upstashSet(CYBER_RPC_KEY, payload, CYBER_SEED_TTL);
-    const ok2 = await upstashSet(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL);
+    const ok1 = await envelopeWrite(CYBER_RPC_KEY, payload, CYBER_SEED_TTL, { recordCount: threats.length, sourceVersion: 'cyber-threats' });
+    const ok2 = await envelopeWrite(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL, { recordCount: threats.length, sourceVersion: 'cyber-threats' });
     const ok3 = await upstashSet('seed-meta:cyber:threats', { fetchedAt: Date.now(), recordCount: threats.length }, 604800);
     console.log(`[Cyber] Seeded ${threats.length} threats (feodo:${feodo.length} urlhaus:${urlhaus.length} c2intel:${c2intel.length} otx:${otx.length} abuseipdb:${abuseipdb.length} redis:${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const newCyber = hydrated.filter(t =>
@@ -3227,8 +3394,8 @@ async function seedPositiveEvents() {
 
     const capped = allEvents.slice(0, POSITIVE_EVENTS_MAX);
     const payload = { events: capped, fetchedAt: Date.now() };
-    const ok1 = await upstashSet(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL);
-    const ok2 = await upstashSet(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL);
+    const ok1 = await envelopeWrite(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL, { recordCount: capped.length, sourceVersion: 'positive-events' });
+    const ok2 = await envelopeWrite(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL, { recordCount: capped.length, sourceVersion: 'positive-events' });
     const ok3 = await upstashSet('seed-meta:positive-events:geo', { fetchedAt: Date.now(), recordCount: capped.length }, 604800);
     console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -3288,7 +3455,7 @@ const RELAY_TIER4_SOURCES = new Set(
   Object.entries(RELAY_SOURCE_TIERS).filter(([, t]) => t === 4).map(([s]) => s),
 );
 
-const RELAY_SCORE_WEIGHTS = { severity: 0.4, sourceTier: 0.2, corroboration: 0.3, recency: 0.1 };
+const RELAY_SCORE_WEIGHTS = { severity: 0.55, sourceTier: 0.2, corroboration: 0.15, recency: 0.1 };
 const RELAY_SEVERITY_SCORES = { critical: 100, high: 75, medium: 50, low: 25, info: 0 };
 
 // Mirrors computeImportanceScore() in list-feed-digest.ts with ONE intentional
@@ -3706,7 +3873,7 @@ async function seedClassify() {
 
     await upstashSet('seed-meta:news:threat-summary', { fetchedAt: Date.now(), recordCount: Object.keys(mergedByCountry).length }, 604800);
     if (Object.keys(mergedByCountry).length > 0) {
-      await upstashSet(NEWS_THREAT_SUMMARY_KEY, { byCountry: mergedByCountry, generatedAt: Date.now() }, NEWS_THREAT_SUMMARY_TTL);
+      await envelopeWrite(NEWS_THREAT_SUMMARY_KEY, { byCountry: mergedByCountry, generatedAt: Date.now() }, NEWS_THREAT_SUMMARY_TTL, { recordCount: Object.keys(mergedByCountry).length, sourceVersion: 'news-threat-summary' });
       console.log(`[Classify] Threat summary written for ${Object.keys(mergedByCountry).length} countries`);
     }
 
@@ -4287,9 +4454,9 @@ async function seedTheaterPosture() {
   const theaters = calculateTheaterPostures(flights);
   const totalVessels = theaters.reduce((sum, t) => sum + t.trackedVessels, 0);
   const payload = { theaters };
-  const ok1 = await upstashSet(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL);
-  const ok2 = await upstashSet(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL);
-  const ok3 = await upstashSet(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL);
+  const ok1 = await envelopeWrite(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
+  const ok2 = await envelopeWrite(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
+  const ok3 = await envelopeWrite(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL, { recordCount: theaters.length, sourceVersion: 'theater-posture' });
   await upstashSet('seed-meta:theater-posture', { fetchedAt: Date.now(), recordCount: flights.length + totalVessels }, 604800);
   const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
@@ -4489,7 +4656,7 @@ async function seedWeatherAlerts() {
       return;
     }
     const payload = { alerts };
-    const ok1 = await upstashSet(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL);
+    const ok1 = await envelopeWrite(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL, { recordCount: alerts.length, sourceVersion: 'nws-weather' });
     const ok2 = await upstashSet('seed-meta:weather:alerts', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
     console.log(`[Weather] Seeded ${alerts.length} alerts (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     const highSeverityAlerts = alerts.filter(a => a.severity === 'Extreme' || a.severity === 'Severe');
@@ -4595,7 +4762,7 @@ async function seedUsaSpending() {
     }
     const totalAmount = awards.reduce((s, a) => s + a.amount, 0);
     const payload = { awards, totalAmount, periodStart, periodEnd, fetchedAt: Date.now() };
-    const ok1 = await upstashSet(SPENDING_REDIS_KEY, payload, SPENDING_CACHE_TTL);
+    const ok1 = await envelopeWrite(SPENDING_REDIS_KEY, payload, SPENDING_CACHE_TTL, { recordCount: awards.length, sourceVersion: 'usaspending' });
     const ok2 = await upstashSet('seed-meta:economic:spending', { fetchedAt: Date.now(), recordCount: awards.length }, 604800);
     console.log(`[Spending] Seeded ${awards.length} awards, $${(totalAmount / 1e6).toFixed(1)}M (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -4708,7 +4875,7 @@ async function seedGscpi() {
         observations,
       },
     };
-    await upstashSet(GSCPI_REDIS_KEY, payload, GSCPI_SEED_TTL);
+    await envelopeWrite(GSCPI_REDIS_KEY, payload, GSCPI_SEED_TTL, { recordCount: observations.length, sourceVersion: 'nyfed-gscpi' });
     await upstashSet('seed-meta:economic:gscpi', { fetchedAt: Date.now(), recordCount: observations.length }, 604800);
     console.log(`[GSCPI] Seeded ${observations.length} months; latest ${latest.date} = ${latest.value.toFixed(2)}`);
   } catch (e) {
@@ -4918,8 +5085,8 @@ async function seedTechEvents() {
       error: '',
     };
 
-    const ok1 = await upstashSet(TECH_EVENTS_REDIS_KEY, payload, TECH_EVENTS_TTL_SECONDS);
-    const ok2 = await upstashSet(TECH_EVENTS_BOOTSTRAP_KEY, payload, TECH_EVENTS_TTL_SECONDS);
+    const ok1 = await envelopeWrite(TECH_EVENTS_REDIS_KEY, payload, TECH_EVENTS_TTL_SECONDS, { recordCount: events.length, sourceVersion: 'tech-events' });
+    const ok2 = await envelopeWrite(TECH_EVENTS_BOOTSTRAP_KEY, payload, TECH_EVENTS_TTL_SECONDS, { recordCount: events.length, sourceVersion: 'tech-events' });
     const ok3 = await upstashSet('seed-meta:research:tech-events', { fetchedAt: Date.now(), recordCount: events.length }, 604800);
     console.log(`[TechEvents] Seeded ${events.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -5169,18 +5336,18 @@ async function seedWorldBank() {
     }
 
     const metaTtl = WB_TTL_SECONDS + 3600;
-    let ok = await upstashSet(WB_BOOTSTRAP_KEY, rankings, WB_TTL_SECONDS);
+    let ok = await envelopeWrite(WB_BOOTSTRAP_KEY, rankings, WB_TTL_SECONDS, { recordCount: rankings.length, sourceVersion: 'worldbank-techreadiness' });
     console.log(`[WB] techReadiness: ${rankings.length} rankings (redis: ${ok ? 'OK' : 'FAIL'})`);
     await upstashSet(`seed-meta:${WB_BOOTSTRAP_KEY}`, { fetchedAt: Date.now(), recordCount: rankings.length }, metaTtl);
 
     if (progressWithData.length > 0) {
-      ok = await upstashSet(WB_PROGRESS_KEY, progressData, WB_TTL_SECONDS);
+      ok = await envelopeWrite(WB_PROGRESS_KEY, progressData, WB_TTL_SECONDS, { recordCount: progressWithData.length, sourceVersion: 'worldbank-progress' });
       console.log(`[WB] progressData: ${progressWithData.length} indicators (redis: ${ok ? 'OK' : 'FAIL'})`);
       await upstashSet(`seed-meta:${WB_PROGRESS_KEY}`, { fetchedAt: Date.now(), recordCount: progressWithData.length }, metaTtl);
     }
 
     if (renewableData.historicalData.length > 0) {
-      ok = await upstashSet(WB_RENEWABLE_KEY, renewableData, WB_TTL_SECONDS);
+      ok = await envelopeWrite(WB_RENEWABLE_KEY, renewableData, WB_TTL_SECONDS, { recordCount: renewableData.historicalData.length, sourceVersion: 'worldbank-renewable' });
       console.log(`[WB] renewableEnergy: ${renewableData.regions.length} regions (redis: ${ok ? 'OK' : 'FAIL'})`);
       await upstashSet(`seed-meta:${WB_RENEWABLE_KEY}`, { fetchedAt: Date.now(), recordCount: renewableData.historicalData.length }, metaTtl);
     }
@@ -5273,7 +5440,7 @@ async function seedCorridorRisk() {
       return;
     }
     latestCorridorRiskData = result;
-    const ok = await upstashSet(CORRIDOR_RISK_REDIS_KEY, result, CORRIDOR_RISK_TTL);
+    const ok = await envelopeWrite(CORRIDOR_RISK_REDIS_KEY, result, CORRIDOR_RISK_TTL, { recordCount: Object.keys(result).length, sourceVersion: 'corridor-risk' });
     await upstashSet('seed-meta:supply_chain:corridorrisk', { fetchedAt: Date.now(), recordCount: Object.keys(result).length }, 604800);
     console.log(`[CorridorRisk] Seeded ${Object.keys(result).length} corridors (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     seedTransitSummaries().catch(e => console.warn('[TransitSummary] Post-CorridorRisk seed error:', e?.message || e));
@@ -5531,8 +5698,8 @@ async function seedUsniFleet() {
     const report = usniParseArticle(htmlContent, articleUrl, articleDate, articleTitle);
     if (!report.vessels.length) { console.warn('[USNI] No vessels parsed, skipping write'); return; }
 
-    const ok = await upstashSet(USNI_REDIS_KEY, report, USNI_TTL);
-    await upstashSet(USNI_STALE_KEY, report, USNI_STALE_TTL);
+    const ok = await envelopeWrite(USNI_REDIS_KEY, report, USNI_TTL, { recordCount: report.vessels.length, sourceVersion: 'usni-fleet' });
+    await envelopeWrite(USNI_STALE_KEY, report, USNI_STALE_TTL, { recordCount: report.vessels.length, sourceVersion: 'usni-fleet' });
     await upstashSet('seed-meta:military:usni-fleet', { fetchedAt: Date.now(), recordCount: report.vessels.length }, 604800);
 
     console.log(`[USNI] ${report.vessels.length} vessels, ${report.strikeGroups.length} CSGs, ${report.regions.length} regions (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
@@ -5608,7 +5775,7 @@ async function seedShippingStress() {
     const stressScore = Math.min(100, Math.max(0, Math.round(40 - avgChange * 3)));
     const stressLevel = stressScore >= 75 ? 'critical' : stressScore >= 50 ? 'elevated' : stressScore >= 25 ? 'moderate' : 'low';
     const payload = { carriers: results, stressScore, stressLevel, fetchedAt: Date.now() };
-    const ok = await upstashSet(SHIPPING_STRESS_REDIS_KEY, payload, SHIPPING_STRESS_TTL);
+    const ok = await envelopeWrite(SHIPPING_STRESS_REDIS_KEY, payload, SHIPPING_STRESS_TTL, { recordCount: results.length, sourceVersion: 'shipping-stress' });
     await upstashSet('seed-meta:supply_chain:shipping_stress', { fetchedAt: Date.now(), recordCount: results.length }, 604800);
     console.log(`[ShippingStress] Seeded ${results.length} carriers score=${stressScore}/${stressLevel} (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     if (stressScore >= 75) {
@@ -5646,8 +5813,12 @@ async function startShippingStressSeedLoop() {
 // ─────────────────────────────────────────────────────────────
 
 const SOCIAL_VELOCITY_REDIS_KEY = 'intelligence:social:reddit:v1';
-const SOCIAL_VELOCITY_TTL = 1800; // 30min — seed runs every 10min (3× safety margin)
-const SOCIAL_VELOCITY_INTERVAL_MS = 10 * 60 * 1000;
+// Hourly cadence (bumped from 10min). Reddit rate-limits Railway datacenter IPs
+// after ~50min of 10-min polling (empirically observed 2026-04-16: both subs
+// returned HTTP 403 on every cycle after 16:26 UTC). Dropping the success-path
+// frequency to 1/hour reduces the traffic Reddit's behavioral heuristic flags on.
+const SOCIAL_VELOCITY_TTL = 10800; // 3h — 3× the 60min interval
+const SOCIAL_VELOCITY_INTERVAL_MS = 60 * 60 * 1000;
 const REDDIT_SUBREDDITS = ['worldnews', 'geopolitics'];
 
 let socialVelocityInFlight = false;
@@ -5709,7 +5880,7 @@ async function seedSocialVelocity() {
     allPosts.sort((a, b) => b.velocityScore - a.velocityScore);
     const top = allPosts.slice(0, 30);
     const payload = { posts: top, fetchedAt: Date.now() };
-    const ok = await upstashSet(SOCIAL_VELOCITY_REDIS_KEY, payload, SOCIAL_VELOCITY_TTL);
+    const ok = await envelopeWrite(SOCIAL_VELOCITY_REDIS_KEY, payload, SOCIAL_VELOCITY_TTL, { recordCount: top.length, sourceVersion: 'social-reddit' });
     await upstashSet('seed-meta:intelligence:social-reddit', { fetchedAt: Date.now(), recordCount: top.length }, 604800);
     console.log(`[SocialVelocity] Seeded ${top.length} posts (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -5738,8 +5909,10 @@ async function startSocialVelocitySeedLoop() {
 // ─────────────────────────────────────────────────────────────
 
 const WSB_TICKERS_REDIS_KEY = 'intelligence:wsb-tickers:v1';
-const WSB_TICKERS_TTL = 1800; // 30min — seed runs every 10min (3× safety margin)
-const WSB_TICKERS_INTERVAL_MS = 10 * 60 * 1000;
+// Hourly cadence (bumped from 10min). Same Reddit-datacenter-IP blocking
+// rationale as SocialVelocity — see comment above.
+const WSB_TICKERS_TTL = 10800; // 3h — 3× the 60min interval
+const WSB_TICKERS_INTERVAL_MS = 60 * 60 * 1000;
 const WSB_TICKERS_RETRY_MS = 20 * 60 * 1000;
 const WSB_SUBREDDITS = ['wallstreetbets', 'stocks', 'investing'];
 
@@ -5764,7 +5937,7 @@ const WSB_TICKER_SET_CACHE_TTL_MS = 30 * 60 * 1000; // refresh known ticker set 
 async function loadWsbTickerSet() {
   if (wsbTickerSetCache && (Date.now() - wsbTickerSetCacheTs < WSB_TICKER_SET_CACHE_TTL_MS)) return wsbTickerSetCache;
   try {
-    const data = await upstashGet('market:stocks-bootstrap:v1');
+    const data = await envelopeRead('market:stocks-bootstrap:v1');
     if (data && Array.isArray(data.quotes)) {
       wsbTickerSetCache = new Set(data.quotes.map(s => s.symbol?.toUpperCase()).filter(Boolean));
       wsbTickerSetCacheTs = Date.now();
@@ -5901,7 +6074,7 @@ async function seedWsbTickers() {
     tickers.sort((a, b) => b.velocityScore - a.velocityScore);
     const top = tickers.slice(0, 50);
     const payload = { tickers: top, fetchedAt: Date.now(), subredditsScanned: WSB_SUBREDDITS.length, postsScanned };
-    const writeOk = await upstashSet(WSB_TICKERS_REDIS_KEY, payload, WSB_TICKERS_TTL);
+    const writeOk = await envelopeWrite(WSB_TICKERS_REDIS_KEY, payload, WSB_TICKERS_TTL, { recordCount: top.length, sourceVersion: 'wsb-tickers' });
     if (writeOk) {
       await upstashSet('seed-meta:intelligence:wsb-tickers', { fetchedAt: Date.now(), recordCount: top.length }, 604800);
     } else {
@@ -5978,7 +6151,12 @@ async function seedClimateNews() {
   const t0 = Date.now();
   try {
     await runClimateNewsSeedScript();
-    console.log(`[ClimateNewsSeed] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    const durMs = Date.now() - t0;
+    console.log(`[ClimateNewsSeed] Completed in ${(durMs / 1000).toFixed(1)}s`);
+    // Heartbeat: success-only write so the health endpoint can alarm on a
+    // stalled loop before the 90min seed-meta threshold fires. TTL=3x interval
+    // (90min) lets two consecutive cycles miss before the key evaporates.
+    upstashSet('relay:heartbeat:climate-news', { fetchedAt: Date.now(), recordCount: 1, durMs }, 90 * 60).catch(() => {});
   } catch (e) {
     const message = e?.killed ? 'timeout' : (e?.message || e);
     console.warn('[ClimateNewsSeed] Seed error:', message);
@@ -6044,7 +6222,13 @@ async function seedChokepointFlows() {
   const t0 = Date.now();
   try {
     await runChokepointFlowsSeedScript();
-    console.log(`[ChokepointFlows] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    const durMs = Date.now() - t0;
+    console.log(`[ChokepointFlows] Completed in ${(durMs / 1000).toFixed(1)}s`);
+    // Heartbeat: success-only write so the health endpoint can alarm at +8h
+    // instead of +12h (seed-meta threshold). This catches the failure mode
+    // where the child process dies at import (ERR_MODULE_NOT_FOUND) and
+    // never refreshes seed-meta.energy:chokepoint-flows. TTL=3x interval.
+    upstashSet('relay:heartbeat:chokepoint-flows', { fetchedAt: Date.now(), recordCount: 1, durMs }, 18 * 3600).catch(() => {});
   } catch (e) {
     const message = e?.killed ? 'timeout' : (e?.message || e);
     console.warn('[ChokepointFlows] Seed error:', message);
@@ -6174,7 +6358,7 @@ async function seedPizzint() {
     } catch { /* GDELT unavailable — non-fatal */ }
 
     const payload = { pizzint, tensionPairs };
-    const ok1 = await upstashSet(PIZZINT_REDIS_KEY, payload, PIZZINT_SEED_TTL);
+    const ok1 = await envelopeWrite(PIZZINT_REDIS_KEY, payload, PIZZINT_SEED_TTL, { recordCount: locations.length, sourceVersion: 'pizzint' });
     const ok2 = await upstashSet('seed-meta:intelligence:pizzint', { fetchedAt: Date.now(), recordCount: locations.length }, 604800);
     console.log(`[PizzINT] Seeded ${locations.length} locations (open:${openLocations.length} spikes:${activeSpikes} defcon:${defconLevel} gdelt:${tensionPairs.length} redis:${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   } catch (e) {
@@ -6325,7 +6509,7 @@ async function seedDodoPrices() {
     // Only write to Redis when ALL prices came from Dodo (no fallback contamination).
     // Partial/fallback results are not persisted — edge endpoint serves them directly with short cache.
     if (priceSource === 'dodo') {
-      const ok1 = await upstashSet(DODO_PRICE_REDIS_KEY, payload, DODO_PRICE_SEED_TTL);
+      const ok1 = await envelopeWrite(DODO_PRICE_REDIS_KEY, payload, DODO_PRICE_SEED_TTL, { recordCount: fetchedCount, sourceVersion: 'dodo-prices' });
       const ok2 = await upstashSet('seed-meta:product-catalog', { fetchedAt: now, recordCount: fetchedCount, priceSource }, 604800);
       console.log(`[DodoPrices] Seeded ${fetchedCount}/${DODO_PRODUCT_IDS.length} from Dodo (redis=${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     } else {
@@ -7170,7 +7354,7 @@ async function seedChokepointTransits() {
     };
   }
   const payload = { transits, fetchedAt: now };
-  await upstashSet(CHOKEPOINT_TRANSIT_KEY, payload, CHOKEPOINT_TRANSIT_TTL);
+  await envelopeWrite(CHOKEPOINT_TRANSIT_KEY, payload, CHOKEPOINT_TRANSIT_TTL, { recordCount: Object.keys(transits).length, sourceVersion: 'chokepoint-transits' });
   await upstashSet('seed-meta:supply_chain:chokepoint_transits', { fetchedAt: now, recordCount: Object.keys(transits).length }, 604800);
   console.log(`[Transit] Seeded ${Object.keys(transits).length} chokepoint transit counts`);
 }
@@ -7183,7 +7367,13 @@ setInterval(() => {
 }, CHOKEPOINT_TRANSIT_INTERVAL_MS).unref?.();
 
 // --- Pre-assembled Transit Summaries (Railway advantage: avoids large Redis reads on Vercel) ---
+// Split storage: compact summary (no history, ~30KB) + per-id history keys (~35KB each).
+// The compact summary is read on every /api/supply-chain/v1/get-chokepoint-status call.
+// History keys are read only on card expand via /get-chokepoint-history. Before this
+// split the combined payload was ~500KB and timed out at Vercel edge's 1.5s Redis read
+// budget (docs/plans/chokepoint-rpc-payload-split.md).
 const TRANSIT_SUMMARY_REDIS_KEY = 'supply_chain:transit-summaries:v1';
+const TRANSIT_SUMMARY_HISTORY_KEY_PREFIX = 'supply_chain:transit-summaries:history:v1:';
 const TRANSIT_SUMMARY_TTL = 3600; // 1h — 6x interval; survives ~5 consecutive missed pings
 const TRANSIT_SUMMARY_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -7227,11 +7417,11 @@ function detectTrafficAnomalyRelay(history, threatLevel) {
 }
 
 async function seedTransitSummaries() {
-  const pw = await upstashGet(PORTWATCH_REDIS_KEY);
+  const pw = await envelopeRead(PORTWATCH_REDIS_KEY);
   if (!pw || typeof pw !== 'object' || Object.keys(pw).length === 0) return;
 
   if (!latestCorridorRiskData) {
-    const persisted = await upstashGet(CORRIDOR_RISK_REDIS_KEY);
+    const persisted = await envelopeRead(CORRIDOR_RISK_REDIS_KEY);
     if (persisted && typeof persisted === 'object' && Object.keys(persisted).length > 0) {
       latestCorridorRiskData = persisted;
       console.log(`[TransitSummary] Hydrated CorridorRisk from Redis (${Object.keys(persisted).length} corridors)`);
@@ -7240,10 +7430,22 @@ async function seedTransitSummaries() {
 
   const now = Date.now();
   const summaries = {};
+  // Iterate the canonical chokepoint ID set rather than whatever pw happens to
+  // carry today. If seed-portwatch dropped 3 of 13 (flaky ArcGIS), those 3
+  // would otherwise vanish from summaries and the RPC would render zero-state
+  // rows for them — which get-chokepoint-status treats as healthy because its
+  // upstreamUnavailable gate fires only on fully-empty summaries. By emitting
+  // all 13 with zero-state for missing IDs, the shape is consistent and the
+  // coverage shortfall surfaces via the `pwCovered/N` log + recordCount only.
+  const CANONICAL_IDS = Object.keys(CHOKEPOINT_THREAT_LEVELS);
+  let pwCovered = 0;
 
-  for (const [cpId, cpData] of Object.entries(pw)) {
+  for (const cpId of CANONICAL_IDS) {
+    const cpData = pw[cpId];
+    if (cpData) pwCovered++;
     const threatLevel = CHOKEPOINT_THREAT_LEVELS[cpId] || 'normal';
-    const anomaly = detectTrafficAnomalyRelay(cpData.history, threatLevel);
+    const history = cpData?.history ?? [];
+    const anomaly = detectTrafficAnomalyRelay(history, threatLevel);
 
     // Get relay transit counts for this chokepoint
     let relayTransit = null;
@@ -7264,25 +7466,52 @@ async function seedTransitSummaries() {
     }
 
     const cr = latestCorridorRiskData?.[cpId];
+
+    // Compact summary: no history field. Consumed by get-chokepoint-status on
+    // every request, so keep it small.
+    // dataAvailable distinguishes genuine zero-traffic (cpData present, 0
+    // crossings) from zero-state fill (upstream missing this cycle). False
+    // here makes the RPC response explicit and lets the client render a
+    // "data unavailable" indicator instead of silently-empty stat rows.
     summaries[cpId] = {
       todayTotal: relayTransit?.total ?? 0,
       todayTanker: relayTransit?.tanker ?? 0,
       todayCargo: relayTransit?.cargo ?? 0,
       todayOther: relayTransit?.other ?? 0,
-      wowChangePct: cpData.wowChangePct ?? 0,
-      history: cpData.history ?? [],
+      wowChangePct: cpData?.wowChangePct ?? 0,
       riskLevel: cr?.riskLevel ?? '',
       incidentCount7d: cr?.incidentCount7d ?? 0,
       disruptionPct: cr?.disruptionPct ?? 0,
       riskSummary: cr?.riskSummary ?? '',
       riskReportAction: cr?.riskReportAction ?? '',
       anomaly,
+      dataAvailable: Boolean(cpData),
     };
+
+    // Per-id history key — only fetched on card expand via GetChokepointHistory.
+    // Write best-effort: a failure here doesn't block the summary publish. An
+    // empty history key just means the chart is unavailable for that chokepoint
+    // until the next successful relay tick.
+    const historyPayload = { chokepointId: cpId, history, fetchedAt: now };
+    const historyOk = await envelopeWrite(
+      `${TRANSIT_SUMMARY_HISTORY_KEY_PREFIX}${cpId}`,
+      historyPayload,
+      TRANSIT_SUMMARY_TTL,
+      { recordCount: history.length, sourceVersion: 'transit-summaries-history' },
+    );
+    if (!historyOk) console.warn(`[TransitSummary] history write failed for ${cpId}`);
   }
 
-  const ok = await upstashSet(TRANSIT_SUMMARY_REDIS_KEY, { summaries, fetchedAt: now }, TRANSIT_SUMMARY_TTL);
-  await upstashSet('seed-meta:supply_chain:transit-summaries', { fetchedAt: now, recordCount: Object.keys(summaries).length }, 604800);
-  console.log(`[TransitSummary] Seeded ${Object.keys(summaries).length} summaries (redis: ${ok ? 'OK' : 'FAIL'})`);
+  if (pwCovered < CANONICAL_IDS.length) {
+    console.warn(`[TransitSummary] portwatch coverage shortfall: ${pwCovered}/${CANONICAL_IDS.length} — missing chokepoints will publish zero-state until next upstream success`);
+  }
+
+  const ok = await envelopeWrite(TRANSIT_SUMMARY_REDIS_KEY, { summaries, fetchedAt: now }, TRANSIT_SUMMARY_TTL, { recordCount: pwCovered, sourceVersion: 'transit-summaries' });
+  // seed-meta recordCount = pwCovered (actual upstream coverage), not the
+  // canonical-shape key count. Lets api/health.js detect a coverage shortfall
+  // as a freshness anomaly rather than being masked by the always-13 shape.
+  await upstashSet('seed-meta:supply_chain:transit-summaries', { fetchedAt: now, recordCount: pwCovered }, 604800);
+  console.log(`[TransitSummary] Seeded ${pwCovered}/${CANONICAL_IDS.length} from portwatch + per-id history (redis: ${ok ? 'OK' : 'FAIL'})`);
 }
 
 // Seed transit summaries every 10 min (same as transit counter)
@@ -10844,16 +11073,19 @@ async function gracefulShutdown(signal) {
     try {
       await Promise.race([
         telegramState.client.disconnect(),
-        new Promise(r => setTimeout(r, 3000)),
+        new Promise(r => setTimeout(r, 10_000)),
       ]);
-    } catch {}
-    telegramState.client = null;
+      console.log('[Relay] Telegram client disconnected cleanly');
+    } catch (e) {
+      console.warn('[Relay] Telegram disconnect error (non-fatal):', e?.message || e);
+    }
+    destroyTelegramClient();
   }
   if (upstreamSocket) {
     try { upstreamSocket.close(); } catch {}
   }
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 5000);
+  setTimeout(() => process.exit(0), 12_000);
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));

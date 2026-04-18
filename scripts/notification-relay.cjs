@@ -192,6 +192,15 @@ async function drainHeldForUser(userId, variant, allowedChannelTypes) {
           alerts: events.map(ev => ({ eventType: ev.eventType, severity: ev.severity ?? 'high', title: ev.payload?.title ?? ev.eventType })),
         },
       });
+      else if (ch.channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
+        ok = await sendWebPush(userId, ch, {
+          title: `WorldMonitor · ${events.length} held alert${events.length === 1 ? '' : 's'}`,
+          body: subject,
+          url: 'https://worldmonitor.app/',
+          tag: `quiet_hours_batch:${userId}`,
+          eventType: 'quiet_hours_batch',
+        });
+      }
       if (ok) anyDelivered = true;
     } catch (err) {
       console.warn(`[relay] drainHeldForUser: delivery error for ${userId}/${ch.channelType}:`, err.message);
@@ -484,6 +493,114 @@ async function sendWebhook(userId, webhookEnvelope, event) {
   }
 }
 
+// ── Web Push (Phase 6) ────────────────────────────────────────────────────────
+//
+// Lazy-require web-push so the relay can still start on Railway if the
+// dep isn't pulled in. If VAPID keys are unset the relay logs once and
+// skips web_push deliveries entirely — telegram/slack/email still work.
+
+let webpushLib = null;
+let webpushConfigured = false;
+let webpushConfigWarned = false;
+
+function getWebpushClient() {
+  if (webpushLib) return webpushLib;
+  try {
+    webpushLib = require('web-push');
+  } catch (err) {
+    if (!webpushConfigWarned) {
+      console.warn('[relay] web-push dep unavailable — web_push deliveries disabled:', err.message);
+      webpushConfigWarned = true;
+    }
+    return null;
+  }
+  return webpushLib;
+}
+
+function ensureVapidConfigured(client) {
+  if (webpushConfigured) return true;
+  const pub = process.env.VAPID_PUBLIC_KEY;
+  const priv = process.env.VAPID_PRIVATE_KEY;
+  const subject = process.env.VAPID_SUBJECT || 'mailto:support@worldmonitor.app';
+  if (!pub || !priv) {
+    if (!webpushConfigWarned) {
+      console.warn('[relay] VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not set — web_push deliveries disabled');
+      webpushConfigWarned = true;
+    }
+    return false;
+  }
+  try {
+    client.setVapidDetails(subject, pub, priv);
+    webpushConfigured = true;
+    return true;
+  } catch (err) {
+    console.warn('[relay] VAPID configuration failed:', err.message);
+    return false;
+  }
+}
+
+/**
+ * Deliver a web push notification to one subscription. Returns true on
+ * success. On 404/410 (subscription gone) the channel is deactivated
+ * in Convex so the next run doesn't re-try a dead endpoint.
+ *
+ * @param {string} userId
+ * @param {{ endpoint: string; p256dh: string; auth: string }} subscription
+ * @param {{ title: string; body: string; url?: string; tag?: string; eventType?: string }} payload
+ */
+async function sendWebPush(userId, subscription, payload) {
+  const client = getWebpushClient();
+  if (!client) return false;
+  if (!ensureVapidConfigured(client)) return false;
+
+  const body = JSON.stringify({
+    title: payload.title || 'WorldMonitor',
+    body: payload.body || '',
+    url: payload.url || 'https://worldmonitor.app/',
+    tag: payload.tag || 'worldmonitor-generic',
+    eventType: payload.eventType,
+  });
+
+  // Event-type-aware TTL. Push services hold undeliverable messages
+  // until TTL expires — a 24h blanket meant a device offline 20h
+  // would reconnect to a flood of yesterday's rss_alerts. Three tiers:
+  //   brief_ready:    12h  — the editorial brief is a daily artefact
+  //                          and remains interesting into the next
+  //                          afternoon even on a long reconnect
+  //   quiet_hours_batch: 6h — by definition the alerts inside are
+  //                          already queued-on-wake; users care
+  //                          about the batch when they wake
+  //   everything else:   30 min — rss_alert / oref_siren / conflict_
+  //                          escalation are transient. After 30 min
+  //                          they're noise; the dashboard is the
+  //                          canonical surface.
+  const ttlSec =
+    payload.eventType === 'brief_ready'        ? 60 * 60 * 12 :
+    payload.eventType === 'quiet_hours_batch'  ? 60 * 60 * 6  :
+    60 * 30;
+
+  try {
+    await client.sendNotification(
+      {
+        endpoint: subscription.endpoint,
+        keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+      },
+      body,
+      { TTL: ttlSec },
+    );
+    return true;
+  } catch (err) {
+    const code = err?.statusCode;
+    if (code === 404 || code === 410) {
+      console.warn(`[relay] web_push ${code} for ${userId} — deactivating`);
+      await deactivateChannel(userId, 'web_push');
+      return false;
+    }
+    console.warn(`[relay] web_push delivery error for ${userId}:`, err?.message ?? String(err));
+    return false;
+  }
+}
+
 // ── Event processing ──────────────────────────────────────────────────────────
 
 function matchesSensitivity(ruleSensitivity, eventSeverity) {
@@ -501,7 +618,7 @@ function matchesSensitivity(ruleSensitivity, eventSeverity) {
  *
  * Shadow mode (default, flag OFF): computes score decision but always falls
  * back to the legacy result so real notifications are unaffected. Logs to
- * shadow:score-log:v1 for tuning.
+ * shadow:score-log (currently v3) for tuning.
  */
 function shouldNotify(rule, event) {
   const passesLegacy = matchesSensitivity(rule.sensitivity, event.severity ?? 'high');
@@ -551,6 +668,20 @@ async function processWelcome(event) {
     await sendDiscord(userId, ch.webhookEnvelope, text);
   } else if (channelType === 'email' && ch.email) {
     await sendEmail(ch.email, 'WorldMonitor Notifications Connected', text);
+  } else if (channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
+    // Welcome push on first web_push connect. Short body — Chrome's
+    // notification shelf clips past ~80 chars on most OSes. Click
+    // opens the dashboard so the user lands somewhere useful. Uses
+    // the 'channel_welcome' event type which maps to the 30-min TTL
+    // in sendWebPush — a welcome past 30 minutes after subscribe is
+    // noise, not value.
+    await sendWebPush(userId, ch, {
+      title: 'WorldMonitor connected',
+      body: "You'll receive alerts here when events match your sensitivity settings.",
+      url: 'https://worldmonitor.app/',
+      tag: `channel_welcome:${userId}`,
+      eventType: 'channel_welcome',
+    });
   }
 }
 
@@ -560,7 +691,7 @@ const IMPORTANCE_SCORE_MIN = Number(process.env.IMPORTANCE_SCORE_MIN ?? 40);
 // The old v1 key (compact string format) is retained by consumers for
 // backward-compat reading but is no longer written. See
 // docs/internal/scoringDiagnostic.md §5 and §9 Step 4.
-const SHADOW_SCORE_LOG_KEY = 'shadow:score-log:v2';
+const SHADOW_SCORE_LOG_KEY = 'shadow:score-log:v3';
 const SHADOW_LOG_TTL = 7 * 24 * 3600; // 7 days
 
 async function shadowLogScore(event) {
@@ -687,9 +818,12 @@ async function processEvent(event) {
   // short-circuit, but we still pay the promise/microtask cost unless gated here.
   if (event.eventType === 'rss_alert') shadowLogScore(event).catch(() => {});
 
-  // Score gate — only for rss_alert; other event types (oref_siren, conflict_escalation,
-  // notam_closure, etc.) never attach importanceScore so they must never be gated here.
-  if (IMPORTANCE_SCORE_LIVE && event.eventType === 'rss_alert') {
+  // Score gate — only for relay-emitted rss_alert (no userId). Browser-submitted
+  // events (with userId) have importanceScore stripped at ingestion and no server-
+  // computed score; gating them would drop every browser notification once
+  // IMPORTANCE_SCORE_LIVE=1 is activated. Other event types (oref_siren,
+  // conflict_escalation, notam_closure) never attach importanceScore.
+  if (IMPORTANCE_SCORE_LIVE && event.eventType === 'rss_alert' && !event.userId) {
     const score = event.payload?.importanceScore ?? 0;
     if (score < IMPORTANCE_SCORE_MIN) {
       console.log(`[relay] Score gate: dropped ${event.eventType} score=${score} < ${IMPORTANCE_SCORE_MIN}`);
@@ -705,11 +839,17 @@ async function processEvent(event) {
     return;
   }
 
+  // If the event carries a userId (browser-submitted via /api/notify), scope
+  // delivery to ONLY that user's own rules. Relay-emitted events (ais-relay,
+  // regional-snapshot) have no userId and fan out to all matching Pro users.
+  // Without this guard, a Pro user can POST arbitrary rss_alert events that
+  // fan out to every other Pro subscriber — see todo #196.
   const matching = enabledRules.filter(r =>
-    (!r.digestMode || r.digestMode === 'realtime') &&   // skip digest-mode rules — handled by seed-digest-notifications cron
+    (!r.digestMode || r.digestMode === 'realtime') &&
     (r.eventTypes.length === 0 || r.eventTypes.includes(event.eventType)) &&
     shouldNotify(r, event) &&
-    (!event.variant || !r.variant || r.variant === event.variant)
+    (!event.variant || !r.variant || r.variant === event.variant) &&
+    (!event.userId || r.userId === event.userId)
   );
 
   if (matching.length === 0) return;
@@ -787,6 +927,20 @@ async function processEvent(event) {
           await sendEmail(ch.email, subject, deliveryText);
         } else if (ch.channelType === 'webhook' && ch.webhookEnvelope) {
           await sendWebhook(rule.userId, ch.webhookEnvelope, event);
+        } else if (ch.channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
+          // Web push carries short payloads (Chrome caps at ~4KB and
+          // auto-truncates longer ones anyway). Use title + first line
+          // of the formatted text as the body; the click URL points
+          // at the event's link if present, else the dashboard.
+          const firstLine = (deliveryText || '').split('\n')[1] || '';
+          const eventUrl = event.payload?.link || event.payload?.url || 'https://worldmonitor.app/';
+          await sendWebPush(rule.userId, ch, {
+            title: event.payload?.title || event.eventType || 'WorldMonitor',
+            body: firstLine,
+            url: eventUrl,
+            tag: `${event.eventType}:${rule.userId}`,
+            eventType: event.eventType,
+          });
         }
       } catch (err) {
         console.warn(`[relay] Delivery error for ${rule.userId}/${ch.channelType}:`, err instanceof Error ? err.message : String(err));

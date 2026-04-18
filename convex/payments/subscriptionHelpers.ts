@@ -287,6 +287,40 @@ export async function handleSubscriptionActive(
       rawPayload: data,
       updatedAt: eventTimestamp,
     });
+
+    // Referral attribution on conversion (Phase 9 / Todo #223).
+    // When a /pro?ref=<code> visitor checks out, Dodo carries the
+    // code through as metadata.affonso_referral (see
+    // convex/payments/checkout.ts). On the FIRST activation of their
+    // subscription we look up the code in userReferralCodes and
+    // insert a userReferralCredits row crediting the sharer. The
+    // `else` branch guards against double-crediting on webhook
+    // replays — existing subscription rows skip this path.
+    const referralCode = data.metadata?.affonso_referral;
+    if (typeof referralCode === "string" && referralCode.length > 0) {
+      const referrer = await ctx.db
+        .query("userReferralCodes")
+        .withIndex("by_code", (q) => q.eq("code", referralCode))
+        .first();
+      if (referrer) {
+        const refereeEmail = (data.customer?.email ?? "").trim().toLowerCase();
+        if (refereeEmail) {
+          const existingCredit = await ctx.db
+            .query("userReferralCredits")
+            .withIndex("by_referrer_email", (q) =>
+              q.eq("referrerUserId", referrer.userId).eq("refereeEmail", refereeEmail),
+            )
+            .first();
+          if (!existingCredit) {
+            await ctx.db.insert("userReferralCredits", {
+              referrerUserId: referrer.userId,
+              refereeEmail,
+              createdAt: eventTimestamp,
+            });
+          }
+        }
+      }
+    }
   }
 
   await upsertEntitlements(ctx, userId, planKey, currentPeriodEnd, eventTimestamp);
@@ -541,6 +575,23 @@ export async function handleSubscriptionExpired(
     rawPayload: data,
     updatedAt: eventTimestamp,
   });
+
+  // Honour a standing complimentary entitlement before revoking. Support
+  // tooling writes compUntil via grantComplimentaryEntitlement; a Dodo
+  // subscription expiring after a cancellation or refund must not wipe the
+  // goodwill credit before it runs out. If the comp is still valid we
+  // leave the entitlement as-is — compUntil already acts as a floor for
+  // validUntil (grant logic keeps them synced).
+  const entitlement = await ctx.db
+    .query("entitlements")
+    .withIndex("by_userId", (q) => q.eq("userId", existing.userId))
+    .first();
+  if (entitlement?.compUntil && entitlement.compUntil > eventTimestamp) {
+    console.log(
+      `[subscriptionHelpers] subscription.expired for ${existing.userId} — complimentary entitlement still valid until ${new Date(entitlement.compUntil).toISOString()}, preserving`,
+    );
+    return;
+  }
 
   // Revoke entitlements by downgrading to free tier
   await upsertEntitlements(ctx, existing.userId, "free", eventTimestamp, eventTimestamp);

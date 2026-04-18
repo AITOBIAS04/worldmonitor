@@ -1,3 +1,5 @@
+import { unwrapEnvelope } from './seed-envelope';
+
 const REDIS_OP_TIMEOUT_MS = 1_500;
 const REDIS_PIPELINE_TIMEOUT_MS = 5_000;
 
@@ -23,6 +25,13 @@ function prefixKey(key: string): string {
   return `${cachedPrefix}${key}`;
 }
 
+// Test-only: invalidate the memoized key prefix so a test that mutates
+// process.env.VERCEL_ENV / VERCEL_GIT_COMMIT_SHA sees the new value on the
+// next read. No production caller should ever invoke this.
+export function __resetKeyPrefixCacheForTests(): void {
+  cachedPrefix = undefined;
+}
+
 /**
  * Like getCachedJson but throws on Redis/network failures instead of returning null.
  * Always uses the raw (unprefixed) key — callers that write via seed scripts (which bypass
@@ -42,7 +51,10 @@ export async function getRawJson(key: string): Promise<unknown | null> {
   });
   if (!resp.ok) throw new Error(`Redis HTTP ${resp.status}`);
   const data = (await resp.json()) as { result?: string };
-  return data.result ? JSON.parse(data.result) : null;
+  if (!data.result) return null;
+  // Envelope-aware: contract-mode canonical keys are stored as {_seed, data}.
+  // unwrapEnvelope is a no-op on legacy (non-envelope) shapes.
+  return unwrapEnvelope(JSON.parse(data.result)).data;
 }
 
 export async function getCachedJson(key: string, raw = false): Promise<unknown | null> {
@@ -62,9 +74,23 @@ export async function getCachedJson(key: string, raw = false): Promise<unknown |
     });
     if (!resp.ok) return null;
     const data = (await resp.json()) as { result?: string };
-    return data.result ? JSON.parse(data.result) : null;
+    if (!data.result) return null;
+    // Envelope-aware by default — RPC consumers get the bare payload regardless
+    // of whether the writer has migrated to contract mode. Legacy shapes pass
+    // through unchanged (unwrapEnvelope returns {_seed: null, data: raw}).
+    return unwrapEnvelope(JSON.parse(data.result)).data;
   } catch (err) {
-    console.warn('[redis] getCachedJson failed:', errMsg(err));
+    // AbortError = timeout; structured + errored so log drains (e.g. Sentry via
+    // Vercel integration) pick it up. Large-payload timeouts used to silently
+    // return null and let downstream callers cache zero-state — see
+    // docs/plans/chokepoint-rpc-payload-split.md for the incident that added
+    // this tag.
+    const isTimeout = err instanceof Error && err.name === 'AbortError';
+    if (isTimeout) {
+      console.error(`[REDIS-TIMEOUT] getCachedJson key=${key} timeoutMs=${REDIS_OP_TIMEOUT_MS}`);
+    } else {
+      console.warn('[redis] getCachedJson failed:', errMsg(err));
+    }
     return null;
   }
 }
@@ -122,7 +148,10 @@ export async function getCachedJsonBatch(keys: string[]): Promise<Map<string, un
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          if (parsed !== NEG_SENTINEL) result.set(keys[i]!, parsed);
+          if (parsed === NEG_SENTINEL) continue;
+          // Envelope-aware: unwrap contract-mode canonical keys; legacy values
+          // pass through.
+          result.set(keys[i]!, unwrapEnvelope(parsed).data);
         } catch { /* skip malformed */ }
       }
     }
