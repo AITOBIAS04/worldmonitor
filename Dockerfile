@@ -11,9 +11,16 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-# Install root dependencies (layer-cached until package.json changes)
+# Install root dependencies (layer-cached until package.json changes).
+#
+# Uses `npm install` (not `npm ci`) because PR #3174 added WASM deps
+# (satori + @resvg/resvg-wasm) that npm ci treats as hard failures on
+# alpine — cascading to silently skip unrelated packages including
+# @upstash/ratelimit, which breaks the build-handlers step.
+# `npm install` is lockfile-respecting but more tolerant of alpine WASM
+# resolution quirks; the handler build only needs server-side deps.
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+RUN npm install --ignore-scripts --no-audit --no-fund
 
 # Copy full source
 COPY . .
