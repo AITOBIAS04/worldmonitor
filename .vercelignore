@@ -18,3 +18,36 @@ target/
 
 # Common local artifacts
 .DS_Store
+
+# =============================================================================
+# Railway-only code — exclude from Vercel deploys to reduce Fluid Active CPU
+# and deploy footprint. These directories belong to the relay + seed crons
+# that run on Railway per docs/architecture, NOT on Vercel edge.
+# =============================================================================
+
+# Relay + 135 seed cron scripts (scripts/ais-relay.cjs + scripts/seed-*.mjs)
+scripts/
+
+# Docker/container build artefacts (Railway and local compose, not Vercel)
+docker/
+Dockerfile
+Dockerfile.*
+docker-compose.yml
+docker-compose.override.yml
+
+# Railway builder config (Vercel doesn't read nixpacks)
+nixpacks.toml
+
+# Test suites and build tools not needed at runtime
+tests/
+e2e/
+proto/
+consumer-prices-core/
+
+# Windsurf / IDE / agent scratch
+.windsurf/
+.agent/
+.agents/
+.claude/
+.factory/
+.planning/
