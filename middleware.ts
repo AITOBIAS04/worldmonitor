@@ -68,11 +68,43 @@ function isAllowedHost(host: string): boolean {
   return ALLOWED_HOSTS.has(host) || VERCEL_PREVIEW_RE.test(host);
 }
 
+// Hosts that serve a single private consumer (Echelon backend).
+// Every request to these hosts must carry ECHELON_WM_AUTH_SECRET as the
+// `x-echelon-auth` header OR a shaped x-worldmonitor-key. Unauthorised
+// requests return 401 at the edge BEFORE any function invocation runs —
+// so bot/crawler traffic does not burn Fluid Active CPU on Hobby tier.
+const ECHELON_ONLY_HOSTS = new Set(['testerapi-five-silk.vercel.app']);
+
+const WM_KEY_SHAPE_EARLY = /^wm_[a-f0-9]{40}$/;
+
+// Paths a monitoring/health probe may hit unauthenticated even on Echelon-only
+// hosts. Keep this list narrow — anything here is fully public on the alias.
+const ECHELON_HOST_PUBLIC_PATHS = new Set(['/api/version', '/api/health']);
+
 export default function middleware(request: Request) {
   const url = new URL(request.url);
   const ua = request.headers.get('user-agent') ?? '';
   const path = url.pathname;
   const host = normalizeHost(request.headers.get('host') ?? url.hostname);
+
+  // Echelon-only host gate. Runs before any other middleware logic so
+  // rejected requests never hit a function invocation.
+  if (ECHELON_ONLY_HOSTS.has(host) && !ECHELON_HOST_PUBLIC_PATHS.has(path)) {
+    const authSecret = process.env.ECHELON_WM_AUTH_SECRET ?? '';
+    const providedEchelonAuth = request.headers.get('x-echelon-auth') ?? '';
+    const providedWmKey =
+      request.headers.get('x-worldmonitor-key') ??
+      request.headers.get('x-api-key') ??
+      '';
+    const okByEchelonAuth = authSecret !== '' && providedEchelonAuth === authSecret;
+    const okByWmKey = WM_KEY_SHAPE_EARLY.test(providedWmKey);
+    if (!okByEchelonAuth && !okByWmKey) {
+      return new Response('{"error":"Unauthorized"}', {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
 
   // Social bot OG response for variant subdomain root pages
   if (path === '/' && SOCIAL_PREVIEW_UA.test(ua)) {
