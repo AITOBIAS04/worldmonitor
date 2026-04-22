@@ -94,7 +94,10 @@ function isAllowedHost(host: string): boolean {
 // `x-echelon-auth` header OR a shaped x-worldmonitor-key. Unauthorised
 // requests return 401 at the edge BEFORE any function invocation runs —
 // so bot/crawler traffic does not burn Fluid Active CPU on Hobby tier.
-const ECHELON_ONLY_HOSTS = new Set(['testerapi-five-silk.vercel.app']);
+const ECHELON_ONLY_HOSTS = new Set([
+  'lattice-echelons-projects-87c94757.vercel.app',
+  'lattice-git-main-echelons-projects-87c94757.vercel.app',
+]);
 
 // Echelon's live key is 48 hex chars; WM's original generateKey() emits 40.
 // Accept any 32+ hex length after `wm_` to tolerate both formats. Real key
